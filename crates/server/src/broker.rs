@@ -6,6 +6,7 @@
 //! shared [`MarketState`] quote cache.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -95,6 +96,26 @@ async fn reap_feed_task(task: tokio::task::JoinHandle<()>) {
     }
 }
 
+/// RAII wrapper that sets `feed_starting` while a stop-then-spawn restart is in
+/// progress and always clears it on drop, so an early return, panic or task
+/// cancellation can never leave the flag stuck `true` (which would make
+/// `feed_running()` report a permanently-alive feed and suppress legitimate
+/// reconnects).
+struct FeedStartingGuard(Arc<AtomicBool>);
+
+impl FeedStartingGuard {
+    fn new(flag: Arc<AtomicBool>) -> Self {
+        flag.store(true, Ordering::Release);
+        Self(flag)
+    }
+}
+
+impl Drop for FeedStartingGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 /// Base spacing between outbound Dhan DATA calls. Dhan meters these at ~1/s per
 /// user; the old 1050ms left zero headroom, so a scanner/chart/portfolio burst
 /// queued up and tripped the `429 / 805` rate limit, which then reset the feed
@@ -108,6 +129,60 @@ const RATE_LIMIT_FIRST_PENALTY_SECS: u64 = 10;
 const RATE_LIMIT_MAX_PENALTY_SECS: u64 = 120;
 /// How long Dhan must stay quiet before the adaptive penalty is forgotten.
 const RATE_LIMIT_DECAY_SECS: u64 = 120;
+/// Maximum number of background candle-seed fetches allowed to be queued on the
+/// Dhan data gate at once. Keeps the reservation horizon bounded so the chart
+/// stays responsive even while a large watch universe is warming.
+const MAX_CONCURRENT_SEEDS: usize = 12;
+
+/// Reservation state for the single global Dhan data gate.
+///
+/// The gate hands out time slots ~1.2s apart without holding the mutex during
+/// the wait, so an operator request can be placed in front of a long background
+/// backlog. Each caller reserves `last + DATA_GATE_MS` (or the adaptive hold,
+/// whichever is later) under the lock, advances `last`, and then sleeps out the
+/// difference on its own.
+struct GateState {
+    /// When the next reserved data slot fires.
+    last: Instant,
+    /// Operator requests waiting. While this is non-zero, background callers
+    /// refuse to extend `last` (they wait and re-check), so the background
+    /// backlog can never push the operator's slot further out.
+    urgent_waiters: u32,
+}
+
+impl Default for GateState {
+    fn default() -> Self {
+        GateState {
+            last: Instant::now() - Duration::from_secs(5),
+            urgent_waiters: 0,
+        }
+    }
+}
+
+/// RAII guard that decrements the gate's `urgent_waiters` when an operator
+/// reservation ends (on success, early return, or task cancellation), so a
+/// cancelled chart request can never permanently starve the background pollers.
+struct UrgentWaiter {
+    gate: Arc<tokio::sync::Mutex<GateState>>,
+    active: bool,
+}
+
+impl Drop for UrgentWaiter {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        if let Ok(mut g) = self.gate.try_lock() {
+            g.urgent_waiters = g.urgent_waiters.saturating_sub(1);
+        } else if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let gate = self.gate.clone();
+            handle.spawn(async move {
+                let mut g = gate.lock().await;
+                g.urgent_waiters = g.urgent_waiters.saturating_sub(1);
+            });
+        }
+    }
+}
 
 /// Adaptive backoff state hung off the single global data gate. When Dhan
 /// returns a rate-limit error the gate refuses to fire again until `hold_until`,
@@ -169,6 +244,13 @@ struct FeedHealth {
     /// Duration of the most recent park, so consecutive parks can double it
     /// (`MAX_PARK_SECS` cap). Reset to 0 once a socket streams again.
     park_secs: u64,
+    /// Access token the current supervisor was started with. `start_feed` uses
+    /// this to make a repeated Connect idempotent: a fresh Connect click (or a
+    /// page reload re-posting saved creds) with the exact same token while the
+    /// feed is already up and streaming must NOT tear the socket down and
+    /// re-subscribe every instrument (that churn spiked CPU and grew the
+    /// subscribe set from ~284 to ~900 for no reason).
+    feed_token: Option<String>,
     ws_task: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -258,7 +340,21 @@ pub struct DhanState {
     /// single global slot is deliberate. Entry latency is instead cut by caching
     /// every LTP the entry path already fetched (see the option-leg resolver)
     /// so it makes the fewest possible calls.
-    gate: Arc<tokio::sync::Mutex<Instant>>,
+    ///
+    /// Callers reserve a *logical future slot* under this lock and then sleep
+    /// OUTSIDE it, so a long background backlog (candle seeds) can never hold the
+    /// mutex and stack its 1200ms sleeps in front of an operator chart request.
+    /// Operator requests (see [`DhanState::user_active`]) jump the reservation
+    /// queue - they only wait for the call already in flight - which is what
+    /// stops the chart / option-chain from stalling ~40s behind hundreds of
+    /// queued scanner seeds.
+    gate: Arc<tokio::sync::Mutex<GateState>>,
+    /// Bounds how many background candle-seed REST fetches may be queued on the
+    /// Dhan gate at once. Without it a whole watch universe (1000+ symbols) can
+    /// park a seed per symbol and push the reservation horizon minutes out. The
+    /// scanner re-requests a still-cold series on its next pass, so a small cap
+    /// simply spreads the warm-up over a few ticks instead of starving the chart.
+    seed_slots: Arc<tokio::sync::Semaphore>,
     /// Spacing for read-only order-book / super-order polls. Kept separate from
     /// the placement budget so reconciliation never consumes an order slot.
     order_read_gate: Arc<tokio::sync::Mutex<Instant>>,
@@ -274,6 +370,14 @@ pub struct DhanState {
     /// connection cap and yields "client id is blocked" 429s. Async so the
     /// stop-then-wait for the previous socket can run while serialised.
     feed_spawn_lock: Arc<tokio::sync::Mutex<()>>,
+    /// True from the moment `spawn_feed_task` takes the stop-then-spawn lock
+    /// until it has published the new supervisor handle. `feed_running()` reads
+    /// `ws_task`, which is briefly `None` in that window (the old handle is taken
+    /// and the new one is not stored yet), so without this flag the 2s API
+    /// reconnect watchdog saw "no supervisor" mid-restart and opened a SECOND
+    /// concurrent Dhan feed. That second socket contended the account's feed slot
+    /// and reset the first, producing a reconnect loop every ~20s.
+    feed_starting: Arc<AtomicBool>,
     /// Previous-session close per quote key, seeded from the REST quote API and
     /// the daily-candle backfill. Dhan's feed never sends a PrevClose packet, so
     /// the live loop reads this map to compute a real change / change_pct on
@@ -317,14 +421,14 @@ impl DhanState {
             watch: Arc::new(Mutex::new(Vec::new())),
             option_subs: Arc::new(Mutex::new(HashSet::new())),
             scanner_subs: Arc::new(Mutex::new(HashSet::new())),
-            gate: Arc::new(tokio::sync::Mutex::new(
-                Instant::now() - Duration::from_secs(5),
-            )),
+            gate: Arc::new(tokio::sync::Mutex::new(GateState::default())),
+            seed_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SEEDS)),
             order_read_gate: Arc::new(tokio::sync::Mutex::new(
                 Instant::now() - Duration::from_secs(5),
             )),
             feed_tx: Arc::new(Mutex::new(None)),
             feed_spawn_lock: Arc::new(tokio::sync::Mutex::new(())),
+            feed_starting: Arc::new(AtomicBool::new(false)),
             closes: Arc::new(Mutex::new(HashMap::new())),
             candle_cache: Arc::new(Mutex::new(HashMap::new())),
             last_user: Arc::new(Mutex::new(Instant::now() - Duration::from_secs(60))),
@@ -453,17 +557,8 @@ impl DhanState {
             .iter()
             .filter(|(sid, _)| *sid > 0)
             .filter_map(|(sid, exch)| {
-                exchange_segment(exch).map(|seg| {
-                    // Indices ride on Ticker mode (Dhan's Index Packet, response
-                    // code 1). Promoting IDX_I to Full for the option-chain path
-                    // silently stopped its ticks and froze the daily change.
-                    let mode = if exch.eq_ignore_ascii_case("IDX_I") {
-                        FeedMode::Ticker
-                    } else {
-                        FeedMode::Full
-                    };
-                    FeedSubscription::with_mode(seg, *sid, mode)
-                })
+                exchange_segment(exch)
+                    .map(|seg| FeedSubscription::with_mode(seg, *sid, feed_mode_for(*sid)))
             })
             .collect();
         if subs.is_empty() {
@@ -590,7 +685,8 @@ impl DhanState {
         let subs: Vec<FeedSubscription> = fresh
             .iter()
             .filter_map(|(sid, exch)| {
-                exchange_segment(exch).map(|seg| FeedSubscription::with_mode(seg, *sid, FeedMode::Full))
+                exchange_segment(exch)
+                    .map(|seg| FeedSubscription::with_mode(seg, *sid, FeedMode::Full))
             })
             .collect();
         if subs.is_empty() {
@@ -603,47 +699,94 @@ impl DhanState {
         }
     }
 
+    /// Read and decay the adaptive hold, returning the instant the gate may next
+    /// fire. Kept separate so both the throttle loop and the diagnostics read the
+    /// same state without duplicating the decay rules.
+    fn current_hold(&self) -> Option<Instant> {
+        let mut h = self.rate_hold.lock().unwrap_or_else(|e| e.into_inner());
+        // The hold window has expired: this gate is opening again, so the burst
+        // counter restarts (the next `429` is a NEW burst and may escalate). The
+        // penalty itself is only forgotten after a long quiet spell, so a rapid
+        // re-burst keeps its larger step.
+        if h.hold_until.map(|u| u <= Instant::now()).unwrap_or(false) {
+            h.hold_until = None;
+            h.seen_in_hold = 0;
+        }
+        if let Some(t) = h.last_limit {
+            if t.elapsed() >= Duration::from_secs(RATE_LIMIT_DECAY_SECS) {
+                h.penalty_secs = 0;
+                h.hold_until = None;
+                h.last_limit = None;
+                h.seen_in_hold = 0;
+                h.consecutive_limits = 0;
+            }
+        }
+        h.hold_until
+    }
+
     /// Block until Dhan's data-API budget allows another request. Dhan meters the
     /// data endpoints together (~1/s per user on this account, error 805), so a
     /// single global slot is the only safe design; the entry path avoids extra
     /// calls by caching every LTP it already fetched.
+    ///
+    /// The wait happens OUTSIDE the gate mutex: each caller loops, reads the
+    /// earliest legal fire instant, and sleeps on its own. Previously the mutex
+    /// was held across the 1200ms sleep, so a backlog of N background candle
+    /// seeds stacked N serialized sleeps in front of an operator chart request -
+    /// the chart (and the F&O / commodity scanners) could stall ~40s. A caller is
+    /// *urgent* while the operator is active, and background callers back off
+    /// whenever an urgent waiter is present.
     async fn throttle(&self) {
-        let mut last = self.gate.lock().await;
-        // Read (and decay) the adaptive hold under a short std lock, then release
-        // it before awaiting so the rate-limit reporter can never be blocked by an
-        // in-flight gate wait.
-        let hold = {
-            let mut h = self.rate_hold.lock().unwrap_or_else(|e| e.into_inner());
-            // The hold window has expired: this gate is opening again, so the
-            // burst counter restarts (the next `429` is a NEW burst and may
-            // escalate). The penalty itself is only forgotten after a long quiet
-            // spell, so a rapid re-burst keeps its larger step.
-            if h.hold_until.map(|u| u <= Instant::now()).unwrap_or(false) {
-                h.hold_until = None;
-                h.seen_in_hold = 0;
-            }
-            if let Some(t) = h.last_limit {
-                if t.elapsed() >= Duration::from_secs(RATE_LIMIT_DECAY_SECS) {
-                    h.penalty_secs = 0;
-                    h.hold_until = None;
-                    h.last_limit = None;
-                    h.seen_in_hold = 0;
-                    h.consecutive_limits = 0;
-                }
-            }
-            h.hold_until
+        self.throttle_impl(self.user_active()).await;
+    }
+
+    /// Try to reserve one of the bounded background candle-seed slots. Returns
+    /// `None` when the seed budget is full, so the caller can skip this pass and
+    /// retry on the next scan tick instead of parking an unbounded backlog on the
+    /// Dhan gate (which is what starved the operator chart for ~40s).
+    pub fn try_seed_slot(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.seed_slots.clone().try_acquire_owned().ok()
+    }
+
+    async fn throttle_impl(&self, urgent: bool) {
+        // Register as an operator waiter for the whole wait so background callers
+        // see the priority pressure and yield. The RAII guard decrements it on
+        // every exit path (success, early return, or cancellation).
+        if urgent {
+            let mut g = self.gate.lock().await;
+            g.urgent_waiters = g.urgent_waiters.saturating_add(1);
+            drop(g);
+        }
+        let _guard = UrgentWaiter {
+            gate: self.gate.clone(),
+            active: urgent,
         };
-        let mut wake = *last + Duration::from_millis(DATA_GATE_MS);
-        if let Some(h) = hold {
-            if h > wake {
-                wake = h;
+        loop {
+            let sleep_for;
+            {
+                let mut g = self.gate.lock().await;
+                // Background callers yield while an operator request is waiting,
+                // so the backlog can never delay the chart by more than one slot.
+                if !urgent && g.urgent_waiters > 0 {
+                    drop(g);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+                let now = Instant::now();
+                let mut eligible = g.last + Duration::from_millis(DATA_GATE_MS);
+                if let Some(h) = self.current_hold() {
+                    if h > eligible {
+                        eligible = h;
+                    }
+                }
+                if now >= eligible {
+                    g.last = now;
+                    return;
+                }
+                sleep_for = eligible - now;
             }
+            tokio::time::sleep(sleep_for).await;
         }
-        let now = Instant::now();
-        if now < wake {
-            tokio::time::sleep(wake - now).await;
-        }
-        *last = Instant::now();
     }
 
     /// Record that Dhan answered a data call with a rate limit (`429 / 805`).
@@ -1510,25 +1653,31 @@ impl DhanState {
                 if has_close {
                     continue;
                 }
-                // Option strikes get their previous close from the batched chain
-                // seed (`seed_chain_quotes`); the daily-candle path below would
-                // fetch them with a futures instrument type and corrupt change.
-                // Scanner-discovered options are not in the option-chain map, so
-                // also ask the scrip master: a FUTSTK fetch on an option id
-                // returns the UNDERLYING's candles, which once poisoned the
-                // option's LTP/previous close and booked phantom P&L.
-                if crate::optionchain::known_option_sid(sid)
-                    || crate::scrip::get().map(|s| s.is_option(sid)).unwrap_or(false)
-                {
-                    continue;
-                }
-                let inst = match exch.as_str() {
-                    "IDX_I" => "INDEX",
-                    "MCX_COMM" => "FUTCOM",
-                    "NSE_FNO" | "BSE_FNO" => "FUTSTK",
-                    _ => "EQUITY",
+                // Option strikes: the daily-candle backfill must fetch them with
+                // their REAL option instrument (OPTFUT / OPTSTK / OPTIDX), never
+                // the futures type. A FUTSTK/FUTCOM fetch on an option id returns
+                // the UNDERLYING's candles and would corrupt the option's previous
+                // close. The scrip master gives us the exact instrument; the
+                // option-chain seed path is preferred when it covers the strike,
+                // but engine-discovered strikes (notably MCX OPTFUT commodities)
+                // are NOT in that map, and skipping them entirely is exactly what
+                // left their `change` / `prev_ltp` at zero so `premium_is_green`
+                // never saw them as green. Resolve the instrument and backfill.
+                let opt_inst = crate::scrip::get()
+                    .and_then(|s| s.contract(sid).map(|c| c.instrument.to_uppercase()))
+                    .filter(|i| matches!(i.as_str(), "OPTFUT" | "OPTSTK" | "OPTIDX" | "OPTCUR"));
+                let inst = if let Some(i) = opt_inst {
+                    i
+                } else {
+                    match exch.as_str() {
+                        "IDX_I" => "INDEX",
+                        "MCX_COMM" => "FUTCOM",
+                        "NSE_FNO" | "BSE_FNO" => "FUTSTK",
+                        _ => "EQUITY",
+                    }
+                    .to_string()
                 };
-                if let Some((last, prev)) = self.fetch_daily_closes(sid, &exch, inst).await {
+                if let Some((last, prev)) = self.fetch_daily_closes(sid, &exch, &inst).await {
                     let ltp = cached
                         .as_ref()
                         .filter(|v| v.get("synth").is_none())
@@ -1706,8 +1855,30 @@ impl DhanState {
             return;
         }
 
-        // No park: let `spawn_feed_task` stop the old socket gracefully and wait
-        // for it to release Dhan's slot before opening the next one.
+        // No park: make a repeated Connect idempotent. A page reload (or the
+        // frontend re-posting saved creds) can call /api/connect again with the
+        // same token while a perfectly healthy feed is already streaming. Tearing
+        // that socket down and re-subscribing every instrument just to reopen the
+        // same feed spiked CPU and grew the subscribe set (~284 -> ~900). If the
+        // token matches and the feed is alive with a fresh heartbeat, keep it.
+        let same_token = {
+            let g = self.health.lock().unwrap_or_else(|e| e.into_inner());
+            g.feed_token.as_deref() == Some(creds.client.access_token())
+        };
+        let fresh = self
+            .health
+            .lock()
+            .ok()
+            .and_then(|g| g.last_activity)
+            .map(|t| t.elapsed() < Duration::from_secs(15))
+            .unwrap_or(false);
+        if same_token && self.feed_running() && fresh {
+            tracing::info!("connect: same live feed already running, skipping restart");
+            return;
+        }
+
+        // Let `spawn_feed_task` stop the old socket gracefully and wait for it to
+        // release Dhan's slot before opening the next one.
         self.spawn_feed_task(creds).await;
     }
 
@@ -1715,6 +1886,14 @@ impl DhanState {
         // Serialise the whole stop-then-spawn so two concurrent callers cannot
         // each leave a live supervisor behind (see `feed_spawn_lock`).
         let _spawn_guard = self.feed_spawn_lock.lock().await;
+        // Mark the restart in progress so `feed_running()` reports "alive" while
+        // the old handle is taken and the new one is not stored yet. Otherwise
+        // the 2s API reconnect watchdog races this window and spawns a second
+        // concurrent feed. Guard clears the flag on drop (early return / panic /
+        // cancellation), and it is also cleared explicitly once the new handle
+        // is published so a healthy restart is immediately visible as "down"-
+        // free without waiting for scope exit.
+        let starting = FeedStartingGuard::new(self.feed_starting.clone());
         // Single-flight: never let two supervisors run at once. Each one holds a
         // Dhan websocket slot, and Dhan caps concurrent feeds per account. Stop
         // the old socket *gracefully* and WAIT for it to exit before opening the
@@ -1747,11 +1926,12 @@ impl DhanState {
             extras.drain(0..extras.len() - MAX_INITIAL_EXTRA);
         }
         // Option strikes registered by the option-chain tab ride along with the
-        // static catalog so they get real websocket ticks too.
+        // static catalog so they get real websocket ticks too. Only actual
+        // options take Full mode; scanner/underlying ids ride Ticker.
         for (sid, exch) in extras {
             if let Some(seg) = exchange_segment(&exch) {
                 if !subs.iter().any(|s| s.security_id == sid.to_string()) {
-                    subs.push(FeedSubscription::with_mode(seg, sid, FeedMode::Full));
+                    subs.push(FeedSubscription::with_mode(seg, sid, feed_mode_for(sid)));
                 }
             }
         }
@@ -1760,6 +1940,7 @@ impl DhanState {
         let closes = self.closes.clone();
         let client_id = creds.client_id.clone();
         let token = creds.client.access_token().to_string();
+        let token_for_health = token.clone();
 
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<FeedCommand>();
         if let Ok(mut g) = self.feed_tx.lock() {
@@ -1771,7 +1952,9 @@ impl DhanState {
         });
         if let Ok(mut g) = self.health.lock() {
             g.ws_task = Some(task);
+            g.feed_token = Some(token_for_health);
         }
+        drop(starting);
     }
 
     /// Tear down the feed supervisor *without* aborting it, so it can send Dhan a
@@ -1806,11 +1989,19 @@ impl DhanState {
         // Drop the heartbeat clock with the socket, so a just-stopped feed
         // cannot read "live" off a stale Pong while it is actually down.
         g.last_activity = None;
+        g.feed_token = None;
         g.ws_task.take()
     }
 
-    /// True while a feed supervisor task is alive (including reconnect backoff).
+    /// True while a feed supervisor task is alive (including reconnect backoff),
+    /// or a stop-then-spawn restart is in-flight. The latter matters because
+    /// `ws_task` is briefly `None` while the old supervisor is reaped and the new
+    /// one is not stored yet; treating that window as "down" let the reconnect
+    /// watchdog start a second concurrent feed.
     fn feed_running(&self) -> bool {
+        if self.feed_starting.load(Ordering::Acquire) {
+            return true;
+        }
         if let Ok(g) = self.health.lock() {
             return g.ws_task.as_ref().map(|t| !t.is_finished()).unwrap_or(false);
         }
@@ -2584,7 +2775,11 @@ async fn run_feed(
     let mut iv_at: HashMap<String, Instant> = HashMap::new();
     let mut oi_base: HashMap<String, f64> = HashMap::new();
     let mut pending: HashMap<String, Value> = HashMap::new();
-    let mut flush = tokio::time::interval(Duration::from_millis(400));
+    // Coalesce ticks into small batches. 150ms keeps the sidebar cadence smooth
+    // (~6-7 pushes/sec) instead of the old 400ms step that read as "ruk ruk".
+    // Coalescing (not per-tick sends) still keeps a busy option burst from
+    // flooding the websocket.
+    let mut flush = tokio::time::interval(Duration::from_millis(150));
     flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
@@ -2871,6 +3066,28 @@ fn exchange_segment(s: &str) -> Option<ExchangeSegment> {
         "BSE_FNO" => ExchangeSegment::BseFno,
         _ => return None,
     })
+}
+
+/// Feed depth for a security: only real OPTION contracts need the full packet
+/// (IV from depth, OI, volume, greeks). Everything else - indices, cash
+/// equities, underlying spot ids and commodity futures - is priced from the LTP
+/// alone, so subscribing it in Ticker mode is enough.
+///
+/// This is the single biggest CPU saver on the 2-core host: the option hot path
+/// used to push its entire window (spot underlying + every strike + scanner
+/// ids) through Full mode, so every one of the ~900 live instruments arrived as
+/// a 60+ byte multi-field packet that `live_quote` then turned into JSON (plus
+/// Black-Scholes greeks) on each tick. Restricting Full to actual options cuts
+/// both the parse volume and the per-tick JSON/greeks work for the underlying
+/// and scanner universe, which is what was saturating both tokio workers.
+fn feed_mode_for(sid: i64) -> FeedMode {
+    let is_option = crate::optionchain::known_option_sid(sid)
+        || crate::scrip::get().map(|s| s.is_option(sid)).unwrap_or(false);
+    if is_option {
+        FeedMode::Full
+    } else {
+        FeedMode::Ticker
+    }
 }
 
 /// The alternate option instrument type Dhan may accept when the scrip-master /

@@ -2417,11 +2417,26 @@ fn summarize_entries(entries: &[Value], label: &str) -> Value {
     } else {
         rets[rets.len() / 2]
     };
-    let good = hit + near;
-    let rate = if evaluated > 0 {
-        good as f64 / evaluated as f64 * 100.0
+    // True win = the target was reached before the stop. "near" is a partial
+    // touch, not a win, so it no longer inflates the headline rate.
+    let wins = entries
+        .iter()
+        .filter(|e| e.get("win").and_then(|x| x.as_bool()).unwrap_or(false))
+        .count();
+    let win_rate = if evaluated > 0 {
+        wins as f64 / evaluated as f64 * 100.0
     } else {
         0.0
+    };
+    let r_mult: Vec<f64> = entries
+        .iter()
+        .filter(|e| e.get("outcome").and_then(|x| x.as_str()) != Some("open"))
+        .filter_map(|e| e.get("rMultiple").and_then(|x| x.as_f64()))
+        .collect();
+    let ev_r = if r_mult.is_empty() {
+        0.0
+    } else {
+        r_mult.iter().sum::<f64>() / r_mult.len() as f64
     };
     let mut buckets: Vec<Value> = Vec::new();
     for (lo, hi) in [(0.0, 60.0), (60.0, 70.0), (70.0, 80.0), (80.0, 100.1)] {
@@ -2433,22 +2448,24 @@ fn summarize_entries(entries: &[Value], label: &str) -> Value {
                     .map(|c| c >= lo && c < hi)
                     .unwrap_or(false)
             })
+            .filter(|e| e.get("outcome").and_then(|x| x.as_str()) != Some("open"))
             .collect();
         let n = b.len();
         let g = b
             .iter()
-            .filter(|e| {
-                matches!(
-                    e.get("outcome").and_then(|x| x.as_str()),
-                    Some("hit") | Some("near")
-                )
-            })
+            .filter(|e| e.get("win").and_then(|x| x.as_bool()).unwrap_or(false))
             .count();
+        let bev = if n > 0 {
+            b.iter().filter_map(|e| e.get("rMultiple").and_then(|x| x.as_f64())).sum::<f64>() / n as f64
+        } else {
+            0.0
+        };
         buckets.push(json!({
             "label": if hi > 100.0 { "80+".to_string() } else { format!("{:.0}-{:.0}", lo, hi - 0.1) },
             "n": n,
             "good": g,
             "rate": nv(Some(if n > 0 { g as f64 / n as f64 * 100.0 } else { 0.0 })),
+            "evR": nv(Some(bev)),
         }));
     }
     let mut months: std::collections::BTreeMap<String, (usize, usize, f64)> =
@@ -2461,10 +2478,7 @@ fn summarize_entries(entries: &[Value], label: &str) -> Value {
         let key = date[..7].to_string();
         let slot = months.entry(key).or_insert((0, 0, 0.0));
         slot.0 += 1;
-        if matches!(
-            e.get("outcome").and_then(|x| x.as_str()),
-            Some("hit") | Some("near")
-        ) {
+        if e.get("win").and_then(|x| x.as_bool()).unwrap_or(false) {
             slot.1 += 1;
         }
         if e.get("outcome").and_then(|x| x.as_str()) != Some("open") {
@@ -2500,10 +2514,13 @@ fn summarize_entries(entries: &[Value], label: &str) -> Value {
         "near": near,
         "miss": miss,
         "stopped": stopped,
+        "wins": wins,
         "open": open,
         "upgraded": upgraded,
-        "goodRate": nv(Some(rate)),
+        "goodRate": nv(Some(win_rate)),
+        "winRate": nv(Some(win_rate)),
         "hitRate": nv(Some(if evaluated > 0 { hit as f64 / evaluated as f64 * 100.0 } else { 0.0 })),
+        "evR": nv(Some(ev_r)),
         "avgReturn": nv(Some(avg)),
         "medianReturn": nv(Some(median)),
         "buckets": buckets,
@@ -2584,6 +2601,109 @@ fn h_rate(s: &HSample, prior: &HSample, i: usize) -> f64 {
         0.5
     };
     ((s.hit[i] as f64 + pr * 20.0) / (s.n[i] as f64 + 20.0) * 100.0).clamp(2.0, 98.0)
+}
+
+/// Measured edge for one score band: how often a call of this composite score
+/// actually reached its target BEFORE its stop, and the average R it returned.
+#[derive(Clone, Default)]
+struct EdgeStat {
+    n: usize,
+    wins: usize,
+    r_sum: f64,
+}
+
+impl EdgeStat {
+    fn win_rate(&self, prior_wr: f64, prior_n: f64) -> f64 {
+        let pr = if prior_wr > 0.0 { prior_wr } else { 0.5 };
+        ((self.wins as f64 + pr * prior_n) / (self.n as f64 + prior_n)).clamp(0.02, 0.98)
+    }
+    fn ev_r(&self) -> f64 {
+        if self.n > 0 {
+            self.r_sum / self.n as f64
+        } else {
+            0.0
+        }
+    }
+}
+
+/// Empirical calibration table built from the walk-forward replay. This is what
+/// replaces the old "data coverage" number that was displayed as a probability
+/// but measured nothing. Confidence is now the MEASURED win-rate of the same
+/// score band, shrunk toward the book's base rate when a band has few samples.
+struct Calib {
+    /// 5 score bands: <50, 50-58, 58-66, 66-73, 73+.
+    bands: [EdgeStat; 5],
+    overall: EdgeStat,
+}
+
+fn score_band(total: f64) -> usize {
+    if total >= 73.0 {
+        4
+    } else if total >= 66.0 {
+        3
+    } else if total >= 58.0 {
+        2
+    } else if total >= 50.0 {
+        1
+    } else {
+        0
+    }
+}
+
+fn build_calib(replay: &[Value]) -> Calib {
+    let mut calib = Calib {
+        bands: Default::default(),
+        overall: EdgeStat::default(),
+    };
+    for e in replay {
+        if e.get("outcome").and_then(|x| x.as_str()) == Some("open") {
+            continue;
+        }
+        let Some(r) = e.get("rMultiple").and_then(|x| x.as_f64()) else {
+            continue;
+        };
+        let win = e.get("win").and_then(|x| x.as_bool()).unwrap_or(r > 0.0);
+        let total = e.get("total").and_then(|x| x.as_f64()).unwrap_or(0.0);
+        let band = score_band(total);
+        for slot in [&mut calib.bands[band], &mut calib.overall] {
+            slot.n += 1;
+            slot.r_sum += r;
+            if win {
+                slot.wins += 1;
+            }
+        }
+    }
+    calib
+}
+
+/// Apply the empirical calibration to a call. Sets `call.confidence` to the
+/// MEASURED win-rate (%) of the score band and exposes the measured EV in R.
+/// Returns `true` when the plan has positive measured EV (or too little evidence
+/// to judge), `false` when it is a proven loser and must be rejected.
+fn apply_calibration(call: &mut Value, total: f64, calib: &Calib) -> bool {
+    let band = score_band(total);
+    let b = &calib.bands[band];
+    let base_wr = calib.overall.win_rate(0.5, 30.0);
+    // Shrink a thin band toward the overall base rate: 20 pseudo-samples.
+    let prior_n = 20.0;
+    let use_overall = b.n < 20;
+    let src = if use_overall { &calib.overall } else { b };
+    let wr = if use_overall {
+        calib.overall.win_rate(0.5, 30.0)
+    } else {
+        b.win_rate(base_wr, prior_n)
+    };
+    let ev = src.ev_r();
+    let n = src.n;
+    // Honesty guard: with real evidence the displayed number can never be wildly
+    // better than the measured rate; with none it stays neutral around 50.
+    call["confidence"] = nv(Some((wr * 100.0).clamp(2.0, 98.0)));
+    call["measuredWinRate"] = nv(Some((wr * 100.0).clamp(2.0, 98.0)));
+    call["evR"] = nv(Some(ev));
+    call["samples"] = json!(n);
+    call["calibrated"] = json!(n >= 20);
+    // Positive EV is required once there is enough evidence to judge.
+    n < 20 || ev > 0.0
 }
 
 /// Attach an empirical timeframe and 3/6/12-month target probabilities from
@@ -2756,12 +2876,18 @@ fn eval_live_predictions(prices: &HashMap<String, f64>, rows: &[Value]) -> Value
         }
         let price = e.get("price").and_then(|x| x.as_f64()).unwrap_or(0.0);
         let target = e.get("target").and_then(|x| x.as_f64()).unwrap_or(0.0);
+        let stop = e.get("stop").and_then(|x| x.as_f64()).unwrap_or(0.0);
         let near = e.get("nearTarget").and_then(|x| x.as_f64()).unwrap_or(0.0);
         let hwm = e
             .get("hwm")
             .and_then(|x| x.as_f64())
             .unwrap_or(price)
             .max(last);
+        let lwm = e
+            .get("lwm")
+            .and_then(|x| x.as_f64())
+            .unwrap_or(price)
+            .min(last);
         let at = e.get("at").and_then(|x| x.as_i64()).unwrap_or(now);
         if let Some((cur_status, cur_conf)) = current.get(&sym) {
             let old_status = e
@@ -2780,13 +2906,27 @@ fn eval_live_predictions(prices: &HashMap<String, f64>, rows: &[Value]) -> Value
             }
         }
         e["hwm"] = nv(Some(hwm));
+        e["lwm"] = nv(Some(lwm));
         e["last"] = nv(Some(last));
         e["lastAt"] = json!(now);
         let ret = if price > 0.0 { (last / price - 1.0) * 100.0 } else { 0.0 };
         e["returnPct"] = nv(Some(ret));
-        if hwm >= target && target > 0.0 {
+        let risk = if price > 0.0 && stop > 0.0 && stop < price { price - stop } else { 0.0 };
+        // Stop-first honesty: if the low of the holding period ever touched the
+        // stop, the trade was stopped - a later rebound must not be scored as a
+        // win. This mirrors the walk-forward replay's stop-first rule.
+        if stop > 0.0 && lwm <= stop {
+            e["state"] = json!("closed");
+            e["outcome"] = json!("stopped");
+            e["win"] = json!(false);
+            e["rMultiple"] = nv(Some(-1.0));
+            e["returnPct"] = nv(Some((stop / price - 1.0) * 100.0));
+            e["closedAt"] = json!(now);
+        } else if hwm >= target && target > 0.0 {
             e["state"] = json!("closed");
             e["outcome"] = json!("hit");
+            e["win"] = json!(true);
+            e["rMultiple"] = nv(Some(if risk > 0.0 { (target - price) / risk } else { 1.0 }));
             e["returnPct"] = nv(Some((target / price - 1.0) * 100.0));
             e["closedAt"] = json!(now);
         } else if hwm >= near && near > 0.0 {
@@ -2794,6 +2934,8 @@ fn eval_live_predictions(prices: &HashMap<String, f64>, rows: &[Value]) -> Value
         } else if now - at >= 180 * 86_400 {
             e["state"] = json!("closed");
             e["outcome"] = json!(if ret >= 0.0 { "expired" } else { "miss" });
+            e["win"] = json!(ret > 0.0);
+            e["rMultiple"] = nv(Some(if risk > 0.0 { (last - price) / risk } else { 0.0 }));
             e["closedAt"] = json!(now);
         }
     }
@@ -2810,7 +2952,10 @@ fn eval_live_predictions(prices: &HashMap<String, f64>, rows: &[Value]) -> Value
         let call = r.get("call").unwrap_or(&Value::Null);
         let status = call.get("status").and_then(|x| x.as_str()).unwrap_or("");
         let conf = call.get("confidence").and_then(|x| x.as_f64()).unwrap_or(0.0);
-        if !matches!(status, "Strong Buy" | "Buy" | "Accumulate") || conf < 55.0 {
+        // Confidence is now the MEASURED replay win-rate, so the journal keeps
+        // only calls that clear a realistic edge (>=52%) - not the old 55 on a
+        // different scale.
+        if !matches!(status, "Strong Buy" | "Buy" | "Accumulate") || conf < 52.0 {
             continue;
         }
         let sym = r.get("symbol").and_then(|x| x.as_str()).unwrap_or("").to_string();
@@ -2820,6 +2965,7 @@ fn eval_live_predictions(prices: &HashMap<String, f64>, rows: &[Value]) -> Value
         let price = r.get("price").and_then(|x| x.as_f64()).unwrap_or(0.0);
         let up = call.get("upsidePct").and_then(|x| x.as_f64()).unwrap_or(0.0);
         let target = call.get("targetPrice").and_then(|x| x.as_f64()).unwrap_or(0.0);
+        let stop = call.get("stopPrice").and_then(|x| x.as_f64()).unwrap_or(0.0);
         entries.push(json!({
             "date": today,
             "at": now,
@@ -2830,8 +2976,10 @@ fn eval_live_predictions(prices: &HashMap<String, f64>, rows: &[Value]) -> Value
             "price": nv(Some(price)),
             "upsidePct": nv(Some(up)),
             "target": nv(Some(target)),
+            "stop": nv(Some(stop)),
             "nearTarget": nv(Some(price * (1.0 + up * 0.6 / 100.0))),
             "hwm": nv(Some(price)),
+            "lwm": nv(Some(price)),
             "last": nv(Some(price)),
             "lastAt": json!(now),
             "state": "open",
@@ -3320,42 +3468,71 @@ async fn scan(dhan: &DhanState) -> Result<(), String> {
                 continue;
             }
             let target = callp.get("targetPrice").and_then(|x| x.as_f64()).unwrap_or(0.0);
+            let stop = callp.get("stopPrice").and_then(|x| x.as_f64()).unwrap_or(0.0);
             let up = callp.get("upsidePct").and_then(|x| x.as_f64()).unwrap_or(0.0);
-            let end = k + 63;
+            // A call with no usable target/stop cannot be replayed honestly, so it
+            // is not measured (and therefore never inflates the hit-rate).
+            if target <= entry_price || stop <= 0.0 || stop >= entry_price {
+                continue;
+            }
+            let risk = entry_price - stop;
+            let reward = target - entry_price;
+            let horizon = 63usize; // ~3 months of trading bars
             let max_end = (k + 252).min(n);
             let mut bars_to_target: Option<usize> = None;
             let mut max_high = 0.0f64;
+            let mut r_mult = 0.0f64;
+            let mut exit_ret = 0.0f64;
+            // "stopped" = hard stop hit, "hit" = target reached, "miss" = neither
+            // within the 3-month horizon (closed at its expiry price).
+            let mut outcome = "miss";
+            let mut win = false;
             for (j, c) in cs[k..max_end].iter().enumerate() {
-                if j < 63 && c.high > max_high {
+                if c.high > max_high {
                     max_high = c.high;
                 }
-                if bars_to_target.is_none() && target > 0.0 && c.high >= target {
+                // STOP-FIRST: a bar that trades through the stop is a loss even if
+                // the same bar also pokes the target. Measuring target-first is
+                // what made the old replay look far better than reality.
+                if c.low <= stop {
+                    outcome = "stopped";
+                    exit_ret = (stop / entry_price - 1.0) * 100.0;
+                    r_mult = -1.0;
+                    break;
+                }
+                if c.high >= target {
+                    outcome = "hit";
                     bars_to_target = Some(j + 1);
+                    exit_ret = (target / entry_price - 1.0) * 100.0;
+                    r_mult = reward / risk;
+                    win = true;
+                    break;
+                }
+                if j + 1 >= horizon {
+                    exit_ret = (c.close / entry_price - 1.0) * 100.0;
+                    r_mult = (c.close - entry_price) / risk;
+                    win = exit_ret > 0.0;
+                    outcome = "miss";
+                    break;
                 }
             }
             let avail = max_end - k;
-            let final_close = cs[end - 1].close;
-            let ret = (final_close / entry_price - 1.0) * 100.0;
-            let near_target = entry_price * (1.0 + up * 0.6 / 100.0);
-            let outcome = if target > 0.0 && max_high >= target {
-                "hit"
-            } else if max_high >= near_target {
-                "near"
-            } else {
-                "miss"
-            };
             replay.push(json!({
                 "date": ymd((cs[k - 1].time + 19_800) / 86_400),
                 "symbol": u.symbol,
                 "cohortDays": back,
                 "status": st,
+                "total": nv(Some(totp)),
                 "confidence": callp.get("confidence").cloned().unwrap_or(Value::Null),
                 "entry": nv(Some(entry_price)),
                 "target": nv(Some(target)),
+                "stop": nv(Some(stop)),
                 "upsidePct": nv(Some(up)),
-                "returnPct": nv(Some(ret)),
+                "returnPct": nv(Some(exit_ret)),
                 "maxGainPct": nv(Some((max_high / entry_price - 1.0) * 100.0)),
                 "outcome": outcome,
+                "win": win,
+                "rMultiple": nv(Some(r_mult)),
                 "availBars": avail,
                 "barsToTarget": match bars_to_target { Some(b) => json!(b), None => Value::Null },
             }));
@@ -3405,6 +3582,7 @@ async fn scan(dhan: &DhanState) -> Result<(), String> {
     }
 
     let hstats = horizon_stats(&replay);
+    let calib = build_calib(&replay);
     let now = now_secs();
     let (mut hist, mut upgrades) = load_status_history();
     if hist.is_empty() {
@@ -3510,6 +3688,19 @@ async fn scan(dhan: &DhanState) -> Result<(), String> {
             }
         }
         if let Some(call) = row.get_mut("call") {
+            // Replace the old data-coverage number with the MEASURED win-rate of
+            // this score band, and reject plans with proven-negative EV so a
+            // structurally losing setup is never presented as a "buy".
+            let edge_ok = apply_calibration(call, total, &calib);
+            if !edge_ok {
+                call["status"] = json!("Avoid");
+                call["rejected"] = json!(true);
+                call["rejectReason"] = json!(format!(
+                    "Measured EV {:.2}R over {} replayed trades is not positive",
+                    call.get("evR").and_then(|x| x.as_f64()).unwrap_or(0.0),
+                    call.get("samples").and_then(|x| x.as_u64()).unwrap_or(0)
+                ));
+            }
             apply_horizon(call, atr, rs, &hstats);
             call["nextStep"] = json!(next_step(total, rs, tscore));
             if !upgraded_from.is_null() {
@@ -4293,11 +4484,11 @@ mod tests {
     fn accuracy_summary_counts_hits_and_near() {
         let entries = vec![
             json!({"date": "2026-01-10", "symbol": "A", "confidence": 72.0,
-                   "upsidePct": 20.0, "outcome": "hit", "returnPct": 20.0}),
+                   "upsidePct": 20.0, "outcome": "hit", "win": true, "rMultiple": 2.0, "returnPct": 20.0}),
             json!({"date": "2026-01-18", "symbol": "B", "confidence": 66.0,
-                   "upsidePct": 15.0, "outcome": "near", "returnPct": 9.0}),
+                   "upsidePct": 15.0, "outcome": "near", "win": false, "rMultiple": -1.0, "returnPct": 9.0}),
             json!({"date": "2026-02-02", "symbol": "C", "confidence": 61.0,
-                   "upsidePct": 12.0, "outcome": "miss", "returnPct": -6.0}),
+                   "upsidePct": 12.0, "outcome": "miss", "win": false, "rMultiple": -0.5, "returnPct": -6.0}),
             json!({"date": "2026-02-10", "symbol": "D", "confidence": 80.0,
                    "upsidePct": 18.0, "outcome": "open", "returnPct": 0.0}),
         ];
@@ -4307,7 +4498,11 @@ mod tests {
         assert_eq!(s.get("near").and_then(|x| x.as_u64()), Some(1));
         assert_eq!(s.get("miss").and_then(|x| x.as_u64()), Some(1));
         assert_eq!(s.get("open").and_then(|x| x.as_u64()), Some(1));
-        assert!((s.get("goodRate").and_then(|x| x.as_f64()).unwrap() - 66.67).abs() < 0.1);
+        // Only target-before-stop counts as a win: 1 of 3, not 2 of 3.
+        assert_eq!(s.get("wins").and_then(|x| x.as_u64()), Some(1));
+        assert!((s.get("goodRate").and_then(|x| x.as_f64()).unwrap() - 33.33).abs() < 0.1);
+        // EV in R = (2.0 - 1.0 - 0.5) / 3.
+        assert!((s.get("evR").and_then(|x| x.as_f64()).unwrap() - 0.17).abs() < 0.1);
         assert!((s.get("avgReturn").and_then(|x| x.as_f64()).unwrap() - 7.67).abs() < 0.1);
         assert_eq!(s.get("months").and_then(|x| x.as_array()).map(|a| a.len()), Some(2));
         assert_eq!(s.get("log").and_then(|x| x.as_array()).map(|a| a.len()), Some(4));
@@ -4359,5 +4554,76 @@ mod tests {
         assert_eq!(ymd(d), "2026-10-23");
         assert_eq!(parse_ymd("2026-10-23"), Some(d));
         assert_eq!(weekday(d), 5);
+    }
+
+    #[test]
+    fn calibration_rejects_a_proven_losing_band() {
+        // 30 replays on the 66-73 band: 8 wins x +2R, 22 losses x -1R = -6R/30.
+        let mut replay = Vec::new();
+        for i in 0..30 {
+            let win = i < 8;
+            replay.push(json!({
+                "total": 68.0,
+                "outcome": if win { "hit" } else { "stopped" },
+                "win": win,
+                "rMultiple": if win { 2.0 } else { -1.0 },
+            }));
+        }
+        let calib = build_calib(&replay);
+        // The band EV is negative (-0.2R) and there is enough evidence to judge.
+        let mut call = json!({});
+        let ok = apply_calibration(&mut call, 68.0, &calib);
+        assert!(!ok, "a measured-negative-EV band must be rejected");
+        assert!(call.get("evR").and_then(|x| x.as_f64()).unwrap() < 0.0);
+        // Confidence must be the measured win-rate (~27%), never a high fake.
+        let conf = call.get("confidence").and_then(|x| x.as_f64()).unwrap();
+        assert!(conf < 40.0, "confidence {conf} should reflect the low win-rate");
+        assert_eq!(call.get("calibrated").and_then(|x| x.as_bool()), Some(true));
+    }
+
+    #[test]
+    fn calibration_accepts_a_profitable_band() {
+        // 30 replays: 18 wins x +2R, 12 losses x -1R = +24R/30 = +0.8R.
+        let mut replay = Vec::new();
+        for i in 0..30 {
+            let win = i < 18;
+            replay.push(json!({
+                "total": 68.0,
+                "outcome": if win { "hit" } else { "stopped" },
+                "win": win,
+                "rMultiple": if win { 2.0 } else { -1.0 },
+            }));
+        }
+        let calib = build_calib(&replay);
+        let mut call = json!({});
+        let ok = apply_calibration(&mut call, 68.0, &calib);
+        assert!(ok);
+        assert!(call.get("evR").and_then(|x| x.as_f64()).unwrap() > 0.0);
+    }
+
+    #[test]
+    fn calibration_is_neutral_with_no_evidence() {
+        // No replay data: never reject, and confidence stays an honest ~50.
+        let calib = build_calib(&[]);
+        let mut call = json!({});
+        let ok = apply_calibration(&mut call, 75.0, &calib);
+        assert!(ok, "no evidence must not reject");
+        let conf = call.get("confidence").and_then(|x| x.as_f64()).unwrap();
+        assert!((conf - 50.0).abs() < 10.0, "conf {conf} should be ~neutral");
+        assert_eq!(call.get("calibrated").and_then(|x| x.as_bool()), Some(false));
+    }
+
+    #[test]
+    fn replay_scores_stop_before_target() {
+        // The summariser must treat a stop-touch as a loss even if the same sample
+        // also touched the target: this is what makes the accuracy panel honest.
+        let entries = vec![
+            json!({"date": "2026-03-01", "symbol": "X", "confidence": 70.0, "total": 68.0,
+                   "outcome": "stopped", "win": false, "rMultiple": -1.0, "returnPct": -5.0}),
+        ];
+        let s = summarize_entries(&entries, "t");
+        assert_eq!(s.get("wins").and_then(|x| x.as_u64()), Some(0));
+        assert_eq!(s.get("goodRate").and_then(|x| x.as_f64()), Some(0.0));
+        assert_eq!(s.get("evR").and_then(|x| x.as_f64()), Some(-1.0));
     }
 }

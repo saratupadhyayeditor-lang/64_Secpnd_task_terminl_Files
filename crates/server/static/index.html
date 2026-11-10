@@ -60,6 +60,8 @@
       <button class="tab-btn" data-tab="paperstats2" title="Paper Trade 2 Stats - executed-trades report for the Paper Trade 2 engine only (simulated fills)">Paper Trade 2 Stats</button>
       <button class="tab-btn" data-tab="papertrade3" title="Paper Trade 3 - independent Paper Trade 2 clone (indices + option-chain commodities) with its own simulated book; shares no data with Paper Trade 1 or 2">Paper Trade 3</button>
       <button class="tab-btn" data-tab="paperstats3" title="Paper Trade 3 Stats - executed-trades report for the Paper Trade 3 engine only (simulated fills)">Paper Trade 3 Stats</button>
+      <button class="tab-btn" data-tab="papertrade4" title="Equity Indicator Based Trade - independent paper engine that trades only liquid NSE cash EQUITY (spot/delivery) on BULLISH indicator filters; no options, strikes or premium">Equity Indicator Based Trade</button>
+      <button class="tab-btn" data-tab="paperstats4" title="Equity Indicator Based Trade Stats - executed-trades report for the Equity Indicator Based Trade engine only (simulated fills)">Equity Trade Stats</button>
       <button class="tab-btn" data-tab="brokers" title="Broker Settings - sabhi supported brokers (Dhan, ICICI Breeze, Angel SmartAPI, Alice Blue, 5paisa, Fyers, Kotak Neo, Zerodha Kite, Upstox) ke API keys / tokens ek jagah, plus per-broker enable switch">Broker Settings</button>
       <button class="tab-btn" data-tab="backup" title="Backup &amp; Restore - complete algo system backup (all tabs, engine settings, templates, strategies, P&amp;L records, monitor lists)">Backup &amp; Restore</button>
       <button class="tab-btn" data-tab="updater" title="App Update - manual GitHub Releases updater with live log and history (desktop app only)">App Update</button>
@@ -266,6 +268,9 @@
     <div class="tab-content" id="tab-papertrade3">
       <iframe class="paper-frame" data-src="./paper3v181.html?v=3" title="Paper Trade 3 (independent simulated engine)"></iframe>
     </div>
+    <div class="tab-content" id="tab-papertrade4">
+      <iframe class="paper-frame" data-src="./paper4v181.html?v=3" title="Equity Indicator Based Trade (independent simulated engine)"></iframe>
+    </div>
     <div class="tab-content" id="tab-rtstats"></div>
     <div class="tab-content" id="tab-rtstats2">
       <iframe class="paper-frame" data-src="./rtstats2.html" title="Trade Stats (Realtime Trading Engine 2)"></iframe>
@@ -281,6 +286,9 @@
     </div>
     <div class="tab-content" id="tab-paperstats3">
       <iframe class="paper-frame" data-src="./paperstats3.html" title="Trade Stats (Paper Trade 3)"></iframe>
+    </div>
+    <div class="tab-content" id="tab-paperstats4">
+      <iframe class="paper-frame" data-src="./paperstats4.html" title="Trade Stats (Equity Indicator Based Trade)"></iframe>
     </div>
     <div class="tab-content" id="tab-brokers">
       <iframe class="paper-frame" data-src="./brokers.html?v=4" title="Broker Settings"></iframe>
@@ -378,9 +386,9 @@
 <script src="./vendor/chart.umd.min.js" defer></script>
 <script type="module">
   import init, { select_symbol, update_oc_quotes, open_option_chart_by_sid, set_oi_trend_enabled, set_trade_lines, clear_trade_lines, set_chart_kind, chart_kind_json, set_chart_timeframe, set_nifty_bbpct_pane, set_formed_only } from "./pkg/algo_web.js?v=85";
-  import { bootSidebar } from "./sidebar.js?v=30";
+  import { bootSidebar } from "./sidebar.js?v=31";
   import { bootConnection } from "./connection.js?v=15";
-  import { bootRealtime } from "./rt181.js?v=44";
+  import { bootRealtime } from "./rt181.js?v=50";
   import { bootRtStats } from "./rtstats.js?v=12";
   import { bootBackup } from "./backup.js?v=3";
   import { bootAccount } from "./account.js?v=2";
@@ -513,19 +521,19 @@
     });
     // Push the current chart selection to the paper panes so their order cards
     // are priced off the symbol the user is viewing.
-    if ((t === "papertrade" || t === "papertrade2" || t === "papertrade3" || t === "autoexp" || t === "aitrader" || t === "realtime2" || t === "realtime3") && pane.querySelector("iframe")) postChartSelection();
+    if ((t === "papertrade" || t === "papertrade2" || t === "papertrade3" || t === "papertrade4" || t === "autoexp" || t === "aitrader" || t === "realtime2" || t === "realtime3") && pane.querySelector("iframe")) postChartSelection();
   });
   // Bridge the main window's live chart selection into BOTH paper frames. The
   // paper pages read window.__chartSelection on demand, so a re-dispatch is
   // enough to make them re-price without reloading.
   function postChartSelection() {
-    document.querySelectorAll("#tab-papertrade iframe, #tab-papertrade2 iframe, #tab-papertrade3 iframe, #tab-realtime2 iframe, #tab-realtime3 iframe").forEach((f) => {
+    document.querySelectorAll("#tab-papertrade iframe, #tab-papertrade2 iframe, #tab-papertrade3 iframe, #tab-papertrade4 iframe, #tab-realtime2 iframe, #tab-realtime3 iframe").forEach((f) => {
       try { if (f && f.contentWindow) f.contentWindow.postMessage({ type: "chartselection" }, "*"); } catch (_) {}
     });
   }
   window.addEventListener("chartselection", postChartSelection);
-  document.querySelectorAll("#tab-papertrade iframe, #tab-papertrade2 iframe, #tab-papertrade3 iframe, #tab-realtime2 iframe, #tab-realtime3 iframe, #tab-paperstats iframe").forEach((f) => {
-    f.addEventListener("load", () => { if (f.closest("#tab-papertrade, #tab-papertrade2, #tab-papertrade3, #tab-realtime2, #tab-realtime3")) postChartSelection(); });
+  document.querySelectorAll("#tab-papertrade iframe, #tab-papertrade2 iframe, #tab-papertrade3 iframe, #tab-papertrade4 iframe, #tab-realtime2 iframe, #tab-realtime3 iframe, #tab-paperstats iframe").forEach((f) => {
+    f.addEventListener("load", () => { if (f.closest("#tab-papertrade, #tab-papertrade2, #tab-papertrade3, #tab-papertrade4, #tab-realtime2, #tab-realtime3")) postChartSelection(); });
   });
   // Old-app global name for the option-premium chart opener (used by the
   // strategies/paper-trade modules).

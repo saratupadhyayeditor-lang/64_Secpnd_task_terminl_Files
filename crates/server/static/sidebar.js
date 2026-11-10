@@ -22,6 +22,9 @@ export function bootSidebar(api) {
     pollTimer: null,
     polling: false,
     started: false,
+    renderPending: false,
+    lastSortAt: 0,
+    lastOcAt: 0,
   };
 
   const $ = (id) => document.getElementById(id);
@@ -427,7 +430,7 @@ export function bootSidebar(api) {
     box.replaceChildren(...list);
   }
 
-  function updateWatchlist(qm) {
+  function updateWatchlist(qm, allowSort) {
     const cats = document.querySelectorAll("#marketWatch .mw-cat");
     for (const cat of cats) {
       const rows = Array.from(cat.querySelectorAll(".mw-row"));
@@ -454,23 +457,25 @@ export function bootSidebar(api) {
       const bullBox = cat.querySelector(".mw-bull");
       const bearBox = cat.querySelector(".mw-bear");
       const load = cat.querySelector(".mw-load");
-      const bull = quoted
-        .filter((r) => parseFloat(r.dataset.pct) >= 0)
-        .sort((a, b) => parseFloat(b.dataset.pct) - parseFloat(a.dataset.pct));
-      const bear = quoted
-        .filter((r) => parseFloat(r.dataset.pct) < 0)
-        .sort((a, b) => parseFloat(b.dataset.pct) - parseFloat(a.dataset.pct));
-      renderGroup(bullBox, bull);
-      renderGroup(bearBox, bear);
+      if (allowSort) {
+        const bull = quoted
+          .filter((r) => parseFloat(r.dataset.pct) >= 0)
+          .sort((a, b) => parseFloat(b.dataset.pct) - parseFloat(a.dataset.pct));
+        const bear = quoted
+          .filter((r) => parseFloat(r.dataset.pct) < 0)
+          .sort((a, b) => parseFloat(b.dataset.pct) - parseFloat(a.dataset.pct));
+        renderGroup(bullBox, bull);
+        renderGroup(bearBox, bear);
+        const bullCount = cat.querySelector(".mw-bull .mw-subcount");
+        const bearCount = cat.querySelector(".mw-bear .mw-subcount");
+        if (bullCount) bullCount.textContent = bull.length;
+        if (bearCount) bearCount.textContent = bear.length;
+      }
       if (load) {
         load.style.display = load.children.length > 1 ? "" : "none";
         const lc = load.querySelector(".mw-subcount");
         if (lc) lc.textContent = load.children.length - 1;
       }
-      const bullCount = cat.querySelector(".mw-bull .mw-subcount");
-      const bearCount = cat.querySelector(".mw-bear .mw-subcount");
-      if (bullCount) bullCount.textContent = bull.length;
-      if (bearCount) bearCount.textContent = bear.length;
     }
   }
 
@@ -519,12 +524,42 @@ export function bootSidebar(api) {
     window.dispatchEvent(new CustomEvent("chartselection", { detail: window.__chartSelection }));
   }
 
+  // Coalesce the many /ws frames of a burst into one paint per animation frame,
+  // capped at ~10 Hz. Without this every incoming frame ran a full render
+  // (dropdown rewrite, watchlist sort/reorder, option-chain serialisation),
+  // which read as a stuttering sidebar.
+  let lastRenderAt = 0;
+  function scheduleRender() {
+    if (state.renderPending) return;
+    state.renderPending = true;
+    const run = () => {
+      state.renderPending = false;
+      const now = performance.now();
+      if (now - lastRenderAt < 100) {
+        setTimeout(scheduleRender, 100 - (now - lastRenderAt));
+        return;
+      }
+      lastRenderAt = now;
+      render();
+    };
+    if (typeof requestAnimationFrame === "function") {
+      requestAnimationFrame(run);
+    } else {
+      setTimeout(run, 16);
+    }
+  }
+
   function render() {
     // Repaint whenever fresh quotes arrive. The live feed pushes ticks, and the
     // REST fallback (see pollRestFallback) rebroadcasts Dhan REST quotes on /ws
     // while the feed is rate-limited, so the day-change column keeps moving.
     const qm = state.quotes;
     publishSelection(qm);
+    // Reorder only on a slow cadence: sorting/replacing rows on every frame made
+    // the watchlist visibly jump ("ruk ruk"). Text still updates in place below.
+    const now = Date.now();
+    const allowSort = now - state.lastSortAt >= 1000;
+    if (allowSort) state.lastSortAt = now;
     const sel = $("symbolSelect");
     if (sel && sel.options.length) {
       for (let _i = 0; _i < sel.options.length; _i++) {
@@ -547,10 +582,13 @@ export function bootSidebar(api) {
         }
       }
     }
-    updateWatchlist(qm);
+    updateWatchlist(qm, allowSort);
     updateCommodityWatch(qm);
     updateChartPnL(qm);
-    if (api.update_oc_quotes) {
+    // Serialising the whole quote map for the option-chain tab is expensive; do
+    // it at most ~3x/sec instead of on every paint.
+    if (api.update_oc_quotes && now - state.lastOcAt >= 300) {
+      state.lastOcAt = now;
       try {
         api.update_oc_quotes(JSON.stringify(qm));
       } catch (e) {
@@ -664,7 +702,7 @@ export function bootSidebar(api) {
           const m = JSON.parse(ev.data);
           if (m.type === "quotes") {
             mergeQuotes(m.data || {});
-            render();
+            scheduleRender();
           }
         } catch (e) {
           /* ignore malformed frame */

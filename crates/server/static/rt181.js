@@ -87,6 +87,17 @@ const COMMODITIES_ONLY = (() => {
   try { return !!window.__COMMODITIES_ONLY__; } catch (_) { return false; }
 })();
 
+// Equity Indicator Based Trade (Paper Trade 4) is a cash-equity-only book: it
+// trades liquid NSE stocks on BULLISH indicator filters and has no option
+// machinery at all. `__EQUITY_ONLY__` makes this shared module hide every
+// option-specific control (strike row, option type, Execute Trade In, strike
+// count, +green/fallback/fastest-rising, manual strike select, premium chart,
+// premium chart only, run-in/trade-in and Picked Strikes) and the bearish
+// filter column, and show the liquid cash-equity universe instead.
+const EQUITY_ONLY = (() => {
+  try { return !!window.__EQUITY_ONLY__; } catch (_) { return false; }
+})();
+
 // Paper Trade 2 is an indices + option-chain commodities only book: the shared
 // module hides the Top Movers stock controls, the NIFTY Trend Following section,
 // the F&O-stock routing selects and the NIFTY BB%b (Pane) for this frame. The
@@ -1556,6 +1567,17 @@ function shell() {
       <div class="rt-engine-row" id="rtLiquidRow">
         <b class="rt-cap" style="color:#4fc3f7">Liquid F&amp;O Stocks:</b>
         <button class="btn-action" data-toggle="liquidOn" id="rtLiquidToggle" style="width:auto;padding:3px 10px;margin:0;font-size:10px">Liquid F&amp;O: OFF</button>
+        <!-- Equity Indicator Based Trade only: daily full-universe liquidity scan
+             controls. Hidden (display:none) on every other engine by the
+             EQUITY_ONLY/paper gating block, so the F&O engines never show them. -->
+        <label class="rtom-f rt-eq-only" id="rtEqTradeCountRow" style="display:none">Stocks to trade <input type="number" data-set="liquidTradeCount" min="1" max="500" step="1" style="width:60px"></label>
+        <label class="rtom-f rt-eq-only" id="rtEqScanTimeRow" style="display:none">Daily scan at <input type="time" data-set="liquidScanTime" style="width:100px"></label>
+        <label class="rtom-f rt-eq-only" id="rtEqMinTurnoverRow" style="display:none" title="Minimum turnover (₹ crore) a stock must show at scan time to be eligible. The ranking is by turnover × growth, so this only keeps the very illiquid names out.">Min turnover <input type="number" data-set="liquidScanMinTurnoverCr" min="0" step="1" style="width:60px"> cr</label>
+        <button class="btn-action rt-eq-only" id="rtEqScanNow" style="display:none;width:auto;padding:3px 10px;margin:0">Scan now</button>
+        <label class="rtom-f rt-eq-only" id="rtEqScanPickRow" style="display:none">Scanned stocks
+          <select id="rtEqScanSelect" style="min-width:220px"><option value="">-- run scan --</option></select>
+        </label>
+        <span class="rt-eq-only" id="rtEqScanInfo" style="display:none;font-size:9px;color:#8ab4f8;flex-basis:100%"></span>
         <label class="rtom-f">Top gainers <input type="number" data-set="liquidGainers" min="0" step="1" style="width:56px"></label>
         <label class="rtom-f">Top losers <input type="number" data-set="liquidLosers" min="0" step="1" style="width:56px"></label>
         <label class="rtom-f">Top gainer
@@ -1999,6 +2021,82 @@ function shell() {
     hideSet("tradeInComm");
   }
 
+  // Equity Indicator Based Trade (Paper Trade 4): a cash-equity-only book. Hide
+  // every option-specific control (the whole Strike row, manual strike select,
+  // premium chart / premium-chart-only, run-in / trade-in routing, the Picked
+  // Strikes readout) plus the Top Movers / NIFTY trend / indices / commodities
+  // sections and the Bearish filter column. Show the liquid cash-equity universe
+  // and keep ONLY the Bullish indicator filters armed. Everything is hidden (not
+  // removed) so shared refresh/render code that reads these nodes keeps working;
+  // the backend also strips them, so a saved file or POST can never re-arm them.
+  if (EQUITY_ONLY) {
+    const hide = (el) => { if (el) el.style.display = "none"; };
+    const hideSet = (key) => {
+      const inp = rt.querySelector('[data-set="' + key + '"]');
+      if (inp) hide(inp.closest("label"));
+    };
+    const hideRow = (id) => {
+      const el = rt.querySelector("#" + id);
+      if (el) hide(el.closest(".rt-engine-row"));
+    };
+    // Whole option Strike row, manual-strike row and premium-only row.
+    const optRow = rt.querySelector('[data-set="optionSide"]')?.closest(".rt-engine-row");
+    if (optRow) hide(optRow);
+    ["optionSide", "strikeMode", "strikeCount", "onlyPositive", "fallbackOppositeSide", "fastestRising", "fastestCount"].forEach(hideSet);
+    hideRow("rtManualStrikeRow");
+    hideSet("manualStrikesEnabled");
+    hideSet("premiumOnly");
+    // Run-in / trade-in routing rows are meaningless for a single spot chart.
+    hideRow("rtRunInRow");
+    hideRow("rtTradeInRow");
+    // Picked Strikes (premium) column in the Running panel.
+    hide(rt.querySelector("#rtRunStrikes")?.closest("div[style*='flex']"));
+    // Top Movers / NIFTY trend / indices / commodities sections.
+    hide(rt.querySelector("#rtMoversToggle")?.closest(".rt-engine-row"));
+    hide(rt.querySelector("#rtMoversList"));
+    hide(rt.querySelector("#rtScannerRemovedRow"));
+    hideRow("rtNiftyTrendToggle");
+    hide(rt.querySelector("#rtNiftyTrendList"));
+    hide(rt.querySelector("#rtIndexTrendRow"));
+    hide(rt.querySelector("#rtCommTrendRow"));
+    hideRow("rtFnoExpiryRow");
+    hideRow("rtStrikesSection");
+    // Bearish filter column: this book is bullish-only.
+    hide(rt.querySelector("#rtFilterSectionBear"));
+    const mirror = rt.querySelector("#rtMirrorFilters");
+    if (mirror) hide(mirror);
+    // Relabel and keep the liquid row: it is this book's cash-equity universe.
+    const liquidRow = rt.querySelector("#rtLiquidRow");
+    if (liquidRow) {
+      const cap = liquidRow.querySelector("b.rt-cap");
+      if (cap) cap.textContent = "Scanned Liquid Equity Stocks:";
+      const tog = rt.querySelector("#rtLiquidToggle");
+      if (tog) tog.textContent = tog.textContent.replace(/Liquid F&O/, "Liquid Equity");
+      const lot = rt.querySelector("#rtLiquidLotWrap");
+      if (lot) hide(lot);
+      // Equity scan controls: show the daily-scan trade count, scan time,
+      // turnover floor, "Scan now" and the scanned-stocks dropdown.
+      ["rtEqTradeCountRow", "rtEqScanTimeRow", "rtEqMinTurnoverRow", "rtEqScanNow", "rtEqScanPickRow", "rtEqScanInfo"].forEach((id) => {
+        const el = rt.querySelector("#" + id);
+        if (el) el.style.display = "";
+      });
+      // Top gainers / Top losers do NOT exist for cash equity: hide those inputs.
+      ["liquidGainers", "liquidLosers"].forEach(hideSet);
+      Array.from(liquidRow.querySelectorAll("span")).forEach((sp) => {
+        if (/Only the liquid index basket/.test(sp.textContent || "")) {
+          sp.textContent =
+            "Daily liquidity scan of the full NSE cash-equity universe (turnover x growth), ranked; the algo trades only the top N most-liquid names you set above. Sirf BULLISH indicator filters entry gate karte hain; har pick spot/delivery BUY hota hai - koi strike, option type ya premium nahi. Remove (x) any stock to keep the engine off it.";
+        }
+      });
+      const gl = rt.querySelector("#rtLiquidGainerSelect")?.closest("label");
+      const ll = rt.querySelector("#rtLiquidLoserSelect")?.closest("label");
+      [gl, ll].forEach((l) => hide(l));
+    }
+    const title = rt.querySelector(".rt-strip .rt-title");
+    if (title) title.textContent = "Equity Indicator Based Trade";
+  }
+
+
   // Auto Experiment: the "Auto Trading (trend + SL + trail + target)" preset is
   // removed from that tab only. Hide the control (the shared refresh/render code
   // that reads the node keeps working) and force the engine's stored value off
@@ -2030,7 +2128,7 @@ function shell() {
   // `/api/rt/nifty-pane`, which each paper frame routes to its own
   // `/api/paper*` engine, so every tab shows its own saved zones/mode. Paper
   // Trade 2 removes this section entirely, so it is never mounted there.
-  if (!PAPER2) mountNiftyBbPctPane();
+  if (!PAPER2 && !EQUITY_ONLY) mountNiftyBbPctPane();
 
   // Shared margin pool: one total margin for the whole app, with a per-tab
   // allotment (hard cap). Mounted at the top of every engine pane so the same
@@ -2953,7 +3051,11 @@ function wire() {
     };
   }
   const trPct = $("rtEngTrailSlPct");
-  if (trPct) trPct.oninput = () => pushSetting({ manualTrailSl: true, manualTrailSlPct: num(trPct.value) });
+  // The Trail SL checkbox is the SINGLE on/off authority. Editing the % field
+  // must only persist the number - it must never silently re-arm a trail the
+  // operator has switched OFF (that was the "unchecked but trail still fires"
+  // bug).
+  if (trPct) trPct.oninput = () => pushSetting({ manualTrailSlPct: num(trPct.value) });
   const netTpCb = $("rtEngNetTp");
   const netTpMin = $("rtEngNetTpMin");
   const netTpGb = $("rtEngNetTpGiveback");
@@ -2974,7 +3076,9 @@ function wire() {
     };
   }
   const ptrPts = $("rtEngPointTrailSlPts");
-  if (ptrPts) ptrPts.oninput = () => pushSetting({ manualPointTrailSl: true, manualPointTrailSlPoints: num(ptrPts.value) });
+  // Same rule as the % field: editing the points value persists the number but
+  // never re-arms the point trail behind the operator's back.
+  if (ptrPts) ptrPts.oninput = () => pushSetting({ manualPointTrailSlPoints: num(ptrPts.value) });
   const pfCb = $("rtEngPtsFromPct");
   if (pfCb)
     pfCb.onchange = () => {
@@ -3015,7 +3119,7 @@ function wire() {
           c.checked = inp.checked;
         });
       }
-      if (!PAPER2 && inp.type === "checkbox" && !inp.checked && STRIKE_BASE_GUARD[k]) {
+      if (!PAPER2 && !EQUITY_ONLY && inp.type === "checkbox" && !inp.checked && STRIKE_BASE_GUARD[k]) {
         uiAlert(
           '"' + STRIKE_BASE_GUARD[k] + '" ON rakhna zaroori hai. "Execute Trade In" ke sare dropdown options isi +green base par kaam karte hain, isliye ise enable kar diya gaya hai.'
         );
@@ -4473,6 +4577,48 @@ function liquidSetIds(key, ids) {
   if (inp) inp.value = ids.join(", ");
 }
 async function loadLiquidUniverse() {
+  // Equity Indicator Based Trade: the "universe" is the daily-scan ranked list,
+  // which changes every scan, so it is refreshed on every call (not cached like
+  // the static F&O basket below).
+  if (EQUITY_ONLY) {
+    try {
+      // Engine-scoped endpoint: inside the paper4 frame `/api/rt/liquid` is
+      // rewritten to `/api/paper4/liquid`, which serves the daily equity scan
+      // (the global `/api/liquid` serves the static F&O basket instead).
+      const r = await get("/api/rt/liquid");
+      const stocks = ((r && r.stocks) || []).slice();
+      stocks.forEach((x) => (liquidNames[num(x.securityId)] = x.name || String(x.securityId)));
+      LIQUID_STOCKS = stocks;
+      const sel = document.getElementById("rtEqScanSelect");
+      if (sel) {
+        const ae = document.activeElement;
+        const keep = sel === ae ? sel.value : null;
+        sel.innerHTML =
+          `<option value="">-- pick stock --</option>` +
+          stocks.map((x) => `<option value="${esc(x.securityId)}">${esc(x.name)} · ₹${num(x.turnoverCr).toFixed(1)}cr</option>`).join("");
+        if (keep) sel.value = keep;
+      }
+      const info = document.getElementById("rtEqScanInfo");
+      if (info) {
+        if (r && r.stocks && r.stocks.length) {
+          info.textContent =
+            `Scanned ${num(r.scanned) || stocks.length} stocks` +
+            (r.day ? " (today)" : "") +
+            ` · top ${num(r.tradeCount) || num(((STATE && STATE.settings) || {}).liquidTradeCount) || ""} traded` +
+            (r.minTurnoverCr != null ? ` · min ₹${num(r.minTurnoverCr)}cr` : "");
+        } else if (r && r.waiting) {
+          info.textContent = "Waiting for scrip master / Dhan feed - scan will run automatically.";
+        } else {
+          info.textContent = r && r.scheduled ? `Daily scan scheduled at ${r.scheduled} IST - or click "Scan now".` : "";
+        }
+      }
+      info && (info.style.display = "");
+      return;
+    } catch (e) {
+      console.warn("equity liquidity scan load failed", e);
+      return;
+    }
+  }
   if (liquidPopulated) return;
   try {
     const r = await get("/api/liquid");
@@ -4557,6 +4703,39 @@ function renderLiquidReadout(m) {
     return;
   }
   box.style.display = "block";
+  // Equity Indicator Based Trade: render the ranked daily-scan stocks (turnover
+  // x growth), not the F&O gainers/losers option leg readout.
+  if (EQUITY_ONLY) {
+    const rows = (m && m.stocks) || [];
+    const cap = (m && m.tradeCount) || num(cfg.liquidTradeCount) || 0;
+    const chip = (r) =>
+      `<span style="display:inline-flex;align-items:center;gap:3px;background:#16163a;border:1px solid #2d2d50;border-radius:8px;padding:1px 4px;margin:1px">` +
+      `<span>${esc(r.name || liquidName(r.securityId))} ` +
+      `<span style="color:#888">· ₹${num(r.turnoverCr).toFixed(1)}cr</span>` +
+      `${r.growthPct != null ? ` <span style="color:#00e676">+${num(r.growthPct).toFixed(0)}%</span>` : ""}` +
+      ` <span style="color:${num(r.changePct) >= 0 ? "#00e676" : "#ef5350"}">${num(r.changePct).toFixed(2)}%</span></span>` +
+      `<button data-liquid-pick-remove="${num(r.securityId)}" data-liquid-pick-name="${esc(r.name || liquidName(r.securityId))}" title="Remove - engine will not trade this" style="background:none;border:none;color:#ef5350;cursor:pointer;font-size:11px;padding:0 2px;line-height:1">\u00d7</button></span>`;
+    const wait = m && m.waiting
+      ? `<span style="color:#ffb74d">Waiting for the scrip master / Dhan feed... scan runs once it is ready.</span><br>`
+      : "";
+    const sched = !rows.length && m && m.scheduled
+      ? `<span style="color:#888">Daily scan scheduled at ${esc(m.scheduled)} IST - click "Scan now" to run it immediately.</span>`
+      : "";
+    box.innerHTML =
+      wait + sched +
+      `<b style="color:#4fc3f7">Top ${cap} most-liquid NSE equity (traded):</b> ${rows.slice(0, Math.max(cap, 1)).map(chip).join(" ") || "--"}<br>` +
+      `<span style="color:#888">${rows.length ? `Ranked ${num(m.scanned) || rows.length} stocks by turnover × growth, scanned ${m.day ? "today" : ""}. Green % = turnover growth vs previous session.` : ""}</span>`;
+    box.querySelectorAll("[data-liquid-pick-remove]").forEach((b) => {
+      b.onclick = (e) => {
+        e.preventDefault();
+        removeLiquidPick(
+          num(b.getAttribute("data-liquid-pick-remove")),
+          b.getAttribute("data-liquid-pick-name")
+        );
+      };
+    });
+    return;
+  }
   const chip = (r) =>
     `<span style="display:inline-flex;align-items:center;gap:3px;background:#16163a;border:1px solid #2d2d50;border-radius:8px;padding:1px 4px;margin:1px">` +
     `<span>${esc(liquidName(r.securityId))} (${num(r.changePct).toFixed(2)}%)</span>` +
@@ -4582,6 +4761,90 @@ function renderLiquidReadout(m) {
   });
 }
 function wireLiquidControls() {
+  // Equity Indicator Based Trade: "Scan now" forces the daily full-universe
+  // liquidity scan; the scanned-stocks dropdown pins a name the same way the F&O
+  // "Add stock" does (always included beyond top-N, builds a spot BUY).
+  if (EQUITY_ONLY) {
+    const scanBtn = document.getElementById("rtEqScanNow");
+    if (scanBtn) {
+      scanBtn.onclick = async () => {
+        scanBtn.disabled = true;
+        const old = scanBtn.textContent;
+        scanBtn.textContent = "Scanning...";
+        try {
+          // Persist the DOM first so a freshly-typed "Stocks to trade" value is
+          // the number the scan ranks/arms against, not the previous saved one.
+          try {
+            await API.settings(settingsFromDom());
+          } catch (_e) { /* scan still runs on the saved settings */ }
+          // Remember the cache stamp BEFORE the scan so we can detect the fresh
+          // one. The POST returns immediately (the heavy sweep runs detached);
+          // we then poll `/liquid` and keep "Scanning..." up until the stamp
+          // moves, so the button reflects reality instead of flashing idle.
+          let before = 0;
+          try {
+            const cur = await get("/api/rt/liquid");
+            before = num(cur && cur.at);
+          } catch (_e) { /* ignore */ }
+          await post("/api/rt/liquid", { action: "scan" });
+          let fresh = null;
+          for (let i = 0; i < 150; i++) {
+            await new Promise((r) => setTimeout(r, 2000));
+            let cur = null;
+            try {
+              cur = await get("/api/rt/liquid");
+            } catch (_e) {
+              continue;
+            }
+            if (!cur) continue;
+            // Done when the cache stamp advanced past the pre-scan value, or a
+            // scan that ran this day already carries rows with a newer `at`.
+            const at = num(cur.at);
+            const hasRows = (cur.stocks || []).length > 0;
+            if (hasRows && (!before || at > before)) {
+              fresh = cur;
+              break;
+            }
+          }
+          if (fresh) {
+            renderLiquidReadout(fresh);
+            await loadLiquidUniverse();
+            const n = (fresh.stocks && fresh.stocks.length) || 0;
+            if (typeof linkToast === "function") linkToast("ok", `Liquidity scan complete: ${n} stocks ranked`);
+          } else if (typeof linkToast === "function") {
+            linkToast("warn", "Scan is taking longer than usual - it will update automatically when done");
+          }
+          refresh();
+        } catch (e) {
+          if (typeof linkToast === "function") linkToast("err", "Liquidity scan failed");
+        } finally {
+          scanBtn.disabled = false;
+          scanBtn.textContent = old;
+        }
+      };
+    }
+    const scanSel = document.getElementById("rtEqScanSelect");
+    if (scanSel) {
+      scanSel.onchange = () => {
+        const id = num(scanSel.value);
+        if (!(id > 0)) return;
+        const ids = liquidIds("liquidList");
+        if (ids.indexOf(id) < 0) ids.push(id);
+        liquidSetIds("liquidList", ids);
+        const ex = scannerExcludedIds().filter((x) => x !== id);
+        STATE.settings = Object.assign({}, (STATE && STATE.settings) || {}, {
+          scannerExclude: ex,
+          liquidList: ids,
+        });
+        scanSel.value = "";
+        API.settings(settingsFromDom()).then(() => {
+          renderLiquidChips();
+          renderScannerRemoved();
+          refresh();
+        });
+      };
+    }
+  }
   // Re-run on every apply: the universe load is async, so the + Add button and
   // the two pickers must be (re)bound even if they were wired before the
   // options existed (an empty <select> cannot emit a pick).
@@ -6023,6 +6286,11 @@ function syncInterlocks() {
   );
   const lqChips = document.getElementById("rtLiquidChips");
   if (lqChips) lqChips.style.opacity = lqActive ? "1" : "0.5";
+  // Equity scan controls follow the same master toggle.
+  ["rtEqTradeCountRow", "rtEqScanTimeRow", "rtEqMinTurnoverRow", "rtEqScanNow", "rtEqScanPickRow"].forEach((id) => {
+    const el = document.getElementById(id);
+    if (el && el.style.display !== "none") el.style.opacity = lqActive ? "1" : "0.6";
+  });
   // The liquid-only lot policy is inert until the scanner arms liquid legs.
   const lqLotWrap = document.getElementById("rtLiquidLotWrap");
   if (lqLotWrap) lqLotWrap.style.opacity = lqActive ? "1" : "0.5";
@@ -6126,7 +6394,7 @@ function applySettingsToDom(s) {
   // strikeBaseNormalized). Paper Trade 2 is exempt: it keeps whatever the
   // operator chose, so the +green base can be turned OFF and the Above/Below-ATM
   // + Number-of-Strikes selection still applies.
-  if (!PAPER2 && !strikeBaseNormalized && (s.onlyPositive === false || s.fallbackOppositeSide === false)) {
+  if (!PAPER2 && !EQUITY_ONLY && !strikeBaseNormalized && (s.onlyPositive === false || s.fallbackOppositeSide === false)) {
     strikeBaseNormalized = true;
     ["onlyPositive", "fallbackOppositeSide"].forEach((k) => {
       const e = document.querySelector('#tab-realtime [data-set="' + k + '"]');

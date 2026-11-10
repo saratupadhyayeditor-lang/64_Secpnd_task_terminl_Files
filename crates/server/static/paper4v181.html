@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Equity Indicator Based Trade - Dhan Algo</title>
+<link rel="stylesheet" href="./app.css?v=17">
+<style>
+  body { display: flex; flex-direction: column; height: 100%; }
+  .paper-banner {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    padding: 6px 10px; background: #102a20; border-bottom: 1px solid #2d7e5a;
+    font-size: 11px; color: #a9ffd0;
+  }
+  .paper-banner b { color: #d9ffe9; letter-spacing: .3px; }
+  .paper-banner span { color: #86c8a8; }
+  .tab-content { flex: 1 1 auto; height: auto; min-height: 0; display: block; }
+  #tab-realtime { overflow-y: auto; }
+  /* Bid/Ask spread: the Rs/% fields fade out when the checkbox is off, and
+     fade back in when it is on. Pure CSS driven by the checkbox state so the
+     gain is right even on a snapshot refresh that only sets `checked`. The
+     `.ba-off` class is a JS fallback for browsers without :has(). */
+  .rt-ba .rt-ba-f { transition: opacity .28s ease, filter .28s ease; }
+  .rt-ba:has(input[type="checkbox"]:not(:checked)) .rt-ba-f { opacity: .28; filter: grayscale(1); }
+  @supports not selector(:has(*)) {
+    .rt-ba.ba-off .rt-ba-f { opacity: .28; filter: grayscale(1); }
+  }
+</style>
+</head>
+<body data-tab="papertrade">
+<div class="paper-banner">
+  <b>Equity Indicator Based Trade</b>
+  <span>Independent paper engine: sirf liquid NSE cash EQUITY (spot/delivery) par BULLISH indicator filters se trades. Live Dhan feed ke saath simulated execution, apna alag settings, strategies, positions aur P&amp;L - koi data kisi doosre tab se share nahi hota. Koi strikes, option type, premium, option chain, indices ya commodities is tab me nahi hain. Koi real order nahi jata.</span>
+</div>
+<div class="tab-content" id="tab-realtime"></div>
+
+<script>
+  // Tell the shared realtime module it is rendering inside a Paper frame so its
+  // operator-facing wording (engine toggle, square-off, status pill) says
+  // "simulated" instead of "LIVE Dhan orders".
+  window.__PAPER__ = true;
+  // EQUITY-ONLY engine: the shared module hides every option-specific control
+  // (strikes, option type, strike walk/ATM, +green premium strikes, premium
+  // chart, option chain), keeps ONLY the bullish indicator filters armed, and
+  // shows the liquid NSE cash-equity universe instead. It also hides the
+  // Top Movers / indices / commodities sections.
+  window.__EQUITY_ONLY__ = true;
+  // This is the FOURTH, fully independent paper engine: every shared-UI call is
+  // routed to `/api/paper4/*`, which persists to its own state file.
+  window.__PAPER_BASE__ = "/api/paper4";
+  // Route every /api/rt call made by the shared realtime UI to THIS paper engine
+  // (`/api/paper4/*`), so the exact same pane logic drives this simulated book.
+  (function () {
+    const orig = window.fetch.bind(window);
+    window.fetch = function (u, o) {
+      if (typeof u === "string" && u.indexOf("/api/rt") === 0) {
+        u = "/api/paper4" + u.slice("/api/rt".length);
+      }
+      return orig(u, o);
+    };
+  })();
+  // Poll only while this pane is actually visible in the parent tab switcher.
+  // The shared realtime UI refreshes at 1s only while `#tab-realtime.active` is
+  // present, so we toggle it from the iframe's real layout visibility instead of
+  // polling forever in a hidden tab. Standalone use (no parent) stays active.
+  (function () {
+    const root = document.getElementById("tab-realtime");
+    const visible = function () {
+      const fe = window.frameElement;
+      if (!fe) return true;
+      return !!(fe.offsetParent && fe.clientHeight > 0);
+    };
+    const sync = function () { root.classList.toggle("active", visible()); };
+    setInterval(sync, 500);
+    sync();
+  })();
+  // Bridge the main window's chart selection so "Use chart symbol" works inside
+  // this paper frame (same origin). Read on demand and re-dispatch when the
+  // parent announces a new chart selection so the order card re-prices live.
+  (function () {
+    try {
+      Object.defineProperty(window, "__chartSelection", {
+        configurable: true,
+        get: function () {
+          try { return window.parent && window.parent.__chartSelection; } catch (e) { return null; }
+        },
+      });
+    } catch (e) { /* non-fatal: paper just falls back to the catalog */ }
+    window.addEventListener("message", function (ev) {
+      if (ev.data && ev.data.type === "chartselection") {
+        window.dispatchEvent(new CustomEvent("chartselection"));
+      }
+    });
+  })();
+</script>
+<script type="module">
+  import { bootRealtime } from "./rt181.js?v=50";
+  import { bootTextSize } from "./textsize.js?v=3";
+  bootRealtime();
+  bootTextSize();
+  const title = document.querySelector("#tab-realtime .rt-strip .rt-title");
+  if (title) title.textContent = "Equity Indicator Based Trade (Simulated)";
+  // Paper-only controls: the simulated wallet + fill model. Each is a normal
+  // `data-set` setting, so the shared pane reads the value back into the field
+  // on every refresh and includes it in any full settings write. These settings
+  // exist only on the paper engine, so they never show in the RT tab.
+  (function () {
+    const funds = document.getElementById("rtFundsPill");
+    if (!funds) return;
+    const box = function (label, key, attrs) {
+      return '<label class="rt-pill" style="display:flex;align-items:center;gap:4px">' + label +
+        '<input type="number" data-set="' + key + '" ' + attrs +
+        ' style="width:78px;background:#0a0a18;color:#e0e0ff;border:1px solid #3a3a60;border-radius:3px;padding:1px 4px;font-size:10px">' +
+        "</label>";
+    };
+    funds.insertAdjacentHTML(
+      "afterend",
+        box("Slippage bps", "paperSlippageBps", 'min="0" step="0.5"') +
+        box("Reject %", "paperRejectPct", 'min="0" max="100" step="1"') +
+        '<span class="rt-ba" style="display:flex;align-items:center;gap:4px">' +
+          '<label class="rt-pill" style="display:flex;align-items:center;gap:4px;color:#66ccff" ' +
+            'title="Bid/Ask spread simulation (paper only): har simulated fill par Dhan ka real bid/ask gap cross hota hai. Effective spread = Rs + % dono ka jod. BUY mark + aadha spread par, SELL mark - aadha spread par fill hota hai; slippage bps iske upar alag lagta hai. Checkbox off = spread bilkul inactive (sirf slippage).">' +
+            '<input type="checkbox" data-set="paperBidAskOn" style="accent-color:#66ccff"> Bid/Ask</label>' +
+          '<label class="rt-pill rt-ba-f" style="display:flex;align-items:center;gap:3px" ' +
+            'title="Full bid/ask spread in rupees. Aadha (half) spread har side lagta hai: BUY +half, SELL -half.">Rs' +
+            '<input type="number" data-set="paperBidAskRs" min="0" step="0.05" ' +
+            'style="width:62px;background:#0a0a18;color:#e0e0ff;border:1px solid #3a3a60;border-radius:3px;padding:1px 4px;font-size:10px">' +
+          '</label>' +
+          '<label class="rt-pill rt-ba-f" style="display:flex;align-items:center;gap:3px" ' +
+            'title="Full bid/ask spread as % of the traded price. Aadha (half) spread har side lagta hai: BUY +half, SELL -half.">%' +
+            '<input type="number" data-set="paperBidAskPct" min="0" step="0.01" ' +
+            'style="width:62px;background:#0a0a18;color:#e0e0ff;border:1px solid #3a3a60;border-radius:3px;padding:1px 4px;font-size:10px">' +
+          '</label>' +
+        '</span>' +
+        '<label class="rt-pill" style="display:flex;align-items:center;gap:4px;color:#ffd700" ' +
+          'title="Deduct simulated Dhan broker charges (STT, brokerage, NSE txn, SEBI, stamp, IPFT and 18% GST) from paper P&L. Off = gross P&L.">' +
+          '<input type="checkbox" data-set="brokerCharges" style="accent-color:#ffd700"> Deduct Dhan charges</label>' +
+        '<label class="rt-pill" style="display:flex;align-items:center;gap:4px;color:#00d4aa" ' +
+          'title="Paper execution latency: entry condition meet hone par trade turant nahi, yahan set kiye gaye milliseconds ke baad execute hoga (real order latency ki tarah). Checkbox off = bilkul inactive, trade turant.">' +
+          '<input type="checkbox" data-set="paperExecDelayOn" style="accent-color:#00d4aa"> Exec delay' +
+          '<input type="number" data-set="paperExecDelayMs" min="0" step="50"' +
+          ' style="width:70px;background:#0a0a18;color:#e0e0ff;border:1px solid #3a3a60;border-radius:3px;padding:1px 4px;font-size:10px"> ms</label>' +
+        '<label class="rt-pill" style="display:flex;align-items:center;gap:4px;color:#ff7b72" ' +
+          'title="Paper exit latency: SL / Trail-SL / Target par trade turant nahi, yahan set kiye gaye milliseconds ke baad cut hoga. Book wahi level par hoga jo bina delay hota (SL par SL, Trail par Trail, Target par Target) - delay sirf cut ko late karta hai, price ko badalta nahi. Checkbox off = exit turant.">' +
+          '<input type="checkbox" data-set="paperExitDelayOn" style="accent-color:#ff7b72"> Exit delay' +
+          '<input type="number" data-set="paperExitDelayMs" min="0" step="50"' +
+          ' style="width:70px;background:#0a0a18;color:#e0e0ff;border:1px solid #3a3a60;border-radius:3px;padding:1px 4px;font-size:10px"> ms</label>' +
+        '<label class="rt-pill" style="display:flex;align-items:center;gap:4px;color:#00d4aa" ' +
+          'title="ON: agar required margin available se zyada ho (funds kam / margin cap), to signal turant SKIP ho jayega - wo trade late/retry par kabhi nahi khulegi. OFF: purana behaviour (margin free hone par wahi signal baad me fill ho sakta hai).">' +
+          '<input type="checkbox" data-set="skipOnMarginBlock" style="accent-color:#00d4aa"> Skip if no margin</label>' +
+        '<label class="rt-pill" style="display:flex;align-items:center;gap:4px;color:#ffb74d" ' +
+          'title="F&O Limit entry (paper only, buying only): buy entry ko Dhan ki tarah market se upar limit price par lagata hai, jisse order 100% fill hota hai (market order jaisa). Limit kabhi entry se neeche nahi lagti; sell par lagu nahi hota.">' +
+          '<input type="checkbox" data-set="fnoLimitOrder" style="accent-color:#ffb74d"> F&O Limit</label>' +
+        '<button type="button" class="btn-action warn" id="rtResetBook" style="width:auto;padding:2px 10px;margin:0;font-size:10px" ' +
+          'title="Poora paper book (closed trades + logs + paper positions) clear karo - clean slate se agla trade. Margin allotment header se control hota hai.">Reset book</button>'
+    );
+    const post = function (key, raw, clamp) {
+      const v = clamp(Math.max(0, Number(raw) || 0));
+      fetch("/api/rt/settings", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ [key]: v }),
+      });
+      return v;
+    };
+    const bind = function (key, clamp) {
+      const inp = funds.parentNode.querySelector('input[data-set="' + key + '"]');
+      if (!inp) return;
+      inp.addEventListener("change", function () { inp.value = post(key, inp.value, clamp); });
+    };
+    bind("paperSlippageBps", function (v) { return v; });
+    bind("paperRejectPct", function (v) { return Math.min(100, v); });
+    // Bid/Ask spread: two plain numeric settings (rupees + percent) and one
+    // master checkbox. The fields dim automatically via CSS while the checkbox
+    // is off; `syncBa` only mirrors that state for browsers without :has().
+    bind("paperBidAskRs", function (v) { return v; });
+    bind("paperBidAskPct", function (v) { return v; });
+    const baOn = funds.parentNode.querySelector('input[data-set="paperBidAskOn"]');
+    if (baOn) {
+      const baWrap = baOn.closest(".rt-ba");
+      const syncBa = function () { if (baWrap) baWrap.classList.toggle("ba-off", !baOn.checked); };
+      baOn.addEventListener("change", function () {
+        syncBa();
+        fetch("/api/rt/settings", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ paperBidAskOn: !!baOn.checked }),
+        });
+      });
+      syncBa();
+    }
+    // Paper execution-latency: the ms field is a non-negative whole number; the
+    // checkbox is the master on/off. Off means the engine never queues a
+    // delayed entry (fully inactive), so the paper book fills instantly.
+    bind("paperExecDelayMs", function (v) { return Math.round(v); });
+    // Paper exit-latency: same idea as the entry delay, but for the cut
+    // (SL / Trail-SL / Target). Off means an exit books inline at the trigger
+    // level; on means it lands `paperExitDelayMs` later at the live mark.
+    bind("paperExitDelayMs", function (v) { return Math.round(v); });
+    // F&O Limit entry toggle: paper-only, buying-only. When on, the entry is
+    // placed as a marketable limit above the market (Dhan-style), so it always
+    // fills like a market order and never sits behind the entry.
+    const fnoCb = funds.parentNode.querySelector('input[data-set="fnoLimitOrder"]');
+    if (fnoCb) {
+      fnoCb.addEventListener("change", function () {
+        fetch("/api/rt/settings", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ fnoLimitOrder: !!fnoCb.checked }),
+        });
+      });
+    }
+    const delayCb = funds.parentNode.querySelector('input[data-set="paperExecDelayOn"]');
+    if (delayCb) {
+      delayCb.addEventListener("change", function () {
+        fetch("/api/rt/settings", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ paperExecDelayOn: !!delayCb.checked }),
+        });
+      });
+    }
+    const exitDelayCb = funds.parentNode.querySelector('input[data-set="paperExitDelayOn"]');
+    if (exitDelayCb) {
+      exitDelayCb.addEventListener("change", function () {
+        fetch("/api/rt/settings", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ paperExitDelayOn: !!exitDelayCb.checked }),
+        });
+      });
+    }
+    // Skip-when-margin-unavailable toggle: plain checkbox setting. When on, an
+    // entry whose margin cannot be funded is dropped immediately and never
+    // retried, so it can never fill late once margin frees.
+    const marginSkipCb = funds.parentNode.querySelector('input[data-set="skipOnMarginBlock"]');
+    if (marginSkipCb) {
+      marginSkipCb.addEventListener("change", function () {
+        fetch("/api/rt/settings", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ skipOnMarginBlock: !!marginSkipCb.checked }),
+        });
+      });
+    }
+    // Reset Margin: restore the running margin to the set amount and clear the
+    // whole paper book (closed trades + logs + open simulated positions) so the
+    // next trade starts again from the full margin - it stays reduced/increased
+    // until this button is pressed.
+    const resetMarginBtn = funds.parentNode.querySelector("#rtResetBook");
+    if (resetMarginBtn) {
+      resetMarginBtn.addEventListener("click", function () {
+        if (!confirm("Clear the paper trade book (closed trades + logs)?")) return;
+        fetch("/api/rt/reset", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ what: "smart" }),
+        }).then(function () { window.location.reload(); });
+      });
+    }
+    // Deduct Dhan charges toggle: a plain checkbox setting. The shared pane reads
+    // it back from `settings.brokerCharges` on every refresh and includes it in any
+    // full settings write, so this only needs to push the new value.
+    const chk = funds.parentNode.querySelector('input[data-set="brokerCharges"]');
+    if (chk) {
+      chk.addEventListener("change", function () {
+        fetch("/api/rt/settings", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ brokerCharges: !!chk.checked }),
+        });
+      });
+    }
+  })();
+</script>
+</body>
+</html>

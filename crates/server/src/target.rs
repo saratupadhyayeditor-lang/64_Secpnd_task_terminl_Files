@@ -1386,19 +1386,25 @@ fn patterns(cs: &[Candle], atr_v: f64) -> Vec<PatternHit> {
     out
 }
 
-/// Walk-forward evidence for the same target/stop rule. For every sampled bar in
-/// an established trend it projects the nearest prior swing level as the target
-/// and one ATR as the stop, then checks which was hit first in the next bars.
-fn backtest(cs: &[Candle]) -> Value {
+/// Walk-forward evidence for the SAME rule the live plan uses.
+///
+/// Live plan geometry (see `compute`): entry on an EMA20/EMA50 trend, target at
+/// the nearest structural level at least `max(0.8*ATR, 0.12% spot)` away (falling
+/// back to a 1 ATR projection when no level exists), and a stop at 1.15 ATR
+/// (never tighter than 1.0 ATR). This function replays exactly that geometry on
+/// historical bars, in the requested direction, so the hit-rate it reports is the
+/// hit-rate the live rule actually earned - not a different rule.
+fn backtest(cs: &[Candle], dir: i64) -> Value {
     let n = cs.len();
-    if n < 120 {
-        return json!({ "trades": 0, "wins": 0, "hitRate": 0.0 });
+    if dir == 0 || n < 140 {
+        return json!({ "trades": 0, "wins": 0, "hitRate": 0.0, "avgR": 0.0, "evR": 0.0 });
     }
     let closes: Vec<f64> = cs.iter().map(|c| c.close).collect();
     let mut trades = 0usize;
     let mut wins = 0usize;
+    let mut r_sum = 0.0f64;
     let mut i = 60usize;
-    while i + 40 < n {
+    while i + 60 < n {
         let e20 = ema_last(&closes[..i], 20);
         let e50 = ema_last(&closes[..i], 50);
         let a = atr(&cs[..i], 14);
@@ -1406,40 +1412,79 @@ fn backtest(cs: &[Candle]) -> Value {
             i += 3;
             continue;
         }
-        let up = e20 > e50 && closes[i - 1] > e20;
-        if !up {
-            i += 3;
-            continue;
-        }
         let entry = closes[i - 1];
-        let prior_high = cs[i.saturating_sub(45)..i]
-            .iter()
-            .map(|c| c.high)
-            .fold(f64::MIN, f64::max);
-        if prior_high <= entry + a * 0.5 {
+        let (trend_ok, min_dist) = if dir > 0 {
+            (e20 > e50 && entry > e20, (a * 0.8).max(entry * 0.0012))
+        } else {
+            (e20 < e50 && entry < e20, (a * 0.8).max(entry * 0.0012))
+        };
+        if !trend_ok {
             i += 3;
             continue;
         }
-        let target = prior_high;
-        let stop = entry - a;
+        // Nearest structural level in the trade direction beyond min_dist, the
+        // same "swing pivot" the live candidate set is built from.
+        let pv = pivots(&cs[..i], 3);
+        let structural: Option<f64> = if dir > 0 {
+            pv.iter()
+                .filter(|p| p.high && p.price > entry + min_dist)
+                .map(|p| p.price)
+                .reduce(f64::min)
+        } else {
+            pv.iter()
+                .filter(|p| !p.high && p.price < entry - min_dist)
+                .map(|p| p.price)
+                .reduce(f64::max)
+        };
+        let target = match structural {
+            Some(t) if t.is_finite() => t,
+            _ => {
+                if dir > 0 {
+                    entry + a * 2.0
+                } else {
+                    entry - a * 2.0
+                }
+            }
+        };
+        // Stop mirrors the live 1.15 ATR (>= 1.0 ATR) floor.
+        let stop = if dir > 0 { entry - a * 1.15 } else { entry + a * 1.15 };
+        let risk = (entry - stop).abs();
+        if risk <= 0.0 {
+            i += 3;
+            continue;
+        }
+        let reward = (target - entry).abs();
+        let r_win = reward / risk;
         trades += 1;
-        for c in &cs[i..(i + 40).min(n)] {
-            let hit_stop = c.low <= stop;
-            let hit_target = c.high >= target;
+        // 60-bar horizon: the target is now a real structural level (not a
+        // 45-bar high), so it needs more room than the old 40 bars.
+        for c in &cs[i..(i + 60).min(n)] {
+            let (hit_stop, hit_target) = if dir > 0 {
+                (c.low <= stop, c.high >= target)
+            } else {
+                (c.high >= stop, c.low <= target)
+            };
             if hit_stop {
+                r_sum -= 1.0;
                 break;
             }
             if hit_target {
                 wins += 1;
+                r_sum += r_win;
                 break;
             }
         }
         i += 3;
     }
+    let hit_rate = if trades > 0 { wins as f64 * 100.0 / trades as f64 } else { 0.0 };
+    let avg_r = if trades > 0 { r_sum / trades as f64 } else { 0.0 };
     json!({
         "trades": trades,
         "wins": wins,
-        "hitRate": if trades > 0 { round2(wins as f64 * 100.0 / trades as f64) } else { 0.0 },
+        "hitRate": round2(hit_rate),
+        "avgR": round2(avg_r),
+        "evR": round2(avg_r),
+        "direction": dir,
     })
 }
 
@@ -1725,8 +1770,18 @@ fn compute(
     let mut best_score = 0.0;
     for cl in &side_clusters {
         let dist = (cl.0 - spot).abs() / a;
+        // Target quality gate: a target closer than 0.8*ATR (or 0.12% of spot)
+        // is inside normal noise and is eaten by costs. Skip it entirely and
+        // look for a real structural level further out.
+        if dist < 0.8 {
+            continue;
+        }
+        // A cluster made only of weak single-touch candidates (total weight <
+        // 2.0) is not a real structure - penalise it hard so a stronger level
+        // further out wins unless there is nothing better.
+        let weak_penalty = if cl.1 < 2.0 { 25.0 } else { 0.0 };
         let agree = cl.2.iter().filter(|c| c.dir == dir || c.dir == 0).count() as f64 / cl.2.len().max(1) as f64;
-        let utility = cl.1 * 10.0 + agree * 8.0 - ((dist - 1.2).max(0.0)) * 4.0;
+        let utility = cl.1 * 10.0 + agree * 8.0 - ((dist - 1.2).max(0.0)) * 4.0 - weak_penalty;
         if utility > best_score {
             best_score = utility;
             best = Some(cl);
@@ -1844,13 +1899,17 @@ fn compute(
     // A one-way trend with no overhead/support structure to cluster still gets
     // an ATR projection so the plan is actionable in both directions.
     if spot > a && dir != 0 && target <= 0.0 {
-        target = if dir > 0 { spot + a } else { spot - a };
-        target2 = if dir > 0 { spot + a * 1.618 } else { spot - a * 1.618 };
+        target = if dir > 0 { spot + a * 2.0 } else { spot - a * 2.0 };
+        target2 = if dir > 0 { spot + a * 3.236 } else { spot - a * 3.236 };
     }
 
     let mut stop = 0.0;
     let mut rr = 0.0;
     if target > 0.0 && dir != 0 {
+        // Stop: 1.15 ATR by default, snapped to a nearby opposite cluster only
+        // when it lies in a sane band. Never tighter than 1.0 ATR - a sub-ATR
+        // stop is inside normal noise and gets hit before any real move.
+        let floor = a * 1.0;
         if dir > 0 {
             let opposite: Vec<&(f64, f64, Vec<Candidate>)> = clusters
                 .iter()
@@ -1861,7 +1920,7 @@ fn compute(
             if want > spot - a * 1.8 && want < spot - a * 0.35 {
                 chosen = want;
             }
-            stop = chosen;
+            stop = chosen.min(spot - floor);
         } else {
             let opposite: Vec<&(f64, f64, Vec<Candidate>)> = clusters
                 .iter()
@@ -1872,7 +1931,7 @@ fn compute(
             if want < spot + a * 1.8 && want > spot + a * 0.35 {
                 chosen = want;
             }
-            stop = chosen;
+            stop = chosen.max(spot + floor);
         }
         let risk = (spot - stop).abs();
         if risk > 0.0 {
@@ -1883,14 +1942,16 @@ fn compute(
         }
     }
 
-    let bt = backtest(cs);
+    let bt = backtest(cs, dir as i64);
     let hit_rate = bt.get("hitRate").and_then(|v| v.as_f64()).unwrap_or(0.0);
     let bt_trades = bt.get("trades").and_then(|v| v.as_i64()).unwrap_or(0);
+    let bt_ev = bt.get("evR").and_then(|v| v.as_f64()).unwrap_or(0.0);
     let bt_mult = if bt_trades >= 10 {
         (0.9 + (hit_rate / 100.0) * 0.2).clamp(0.85, 1.1)
     } else {
         1.0
     };
+    let edge_ok = bt_trades < 10 || bt_ev > 0.0;
     let factor_agree = if factors.is_empty() {
         0.0
     } else {
@@ -1979,11 +2040,28 @@ fn compute(
     if dir != 0 && target > 0.0 {
         confidence += edge_bonus;
     }
+    // Expected-value gate: when there is enough measured evidence, a plan whose
+    // walk-forward expected value per trade is not positive is rejected outright
+    // (NO BUY) instead of being shown with a misleading confidence. This is what
+    // stops structurally losing setups (e.g. RR too small for the hit-rate) from
+    // ever being traded.
+    let mut rejected_reason: Option<String> = None;
+    if dir != 0 && target > 0.0 && bt_trades >= 20 && !edge_ok {
+        rejected_reason = Some(format!(
+            "Measured EV {:.2}R over {} trades is not positive - plan rejected",
+            bt_ev, bt_trades
+        ));
+        warnings.push(rejected_reason.clone().unwrap_or_default());
+    }
     if dir == 0 || target <= 0.0 {
         confidence = 0.0;
         edge_bonus = 0.0;
     }
-    let confidence = confidence.clamp(0.0, 100.0);
+    let confidence = if rejected_reason.is_some() {
+        0.0
+    } else {
+        confidence.clamp(0.0, 100.0)
+    };
 
     if dir > 0 && ch.has && ch.pcr < 0.75 {
         warnings.push("Low PCR (call-heavy) - upside may be capped".into());
@@ -1994,7 +2072,9 @@ fn compute(
 
 
     let mut out = json!({
-        "ok": target > 0.0 && dir != 0,
+        "ok": target > 0.0 && dir != 0 && rejected_reason.is_none(),
+        "rejected": rejected_reason.is_some(),
+        "rejectReason": rejected_reason.clone().unwrap_or_default(),
         "underlying": key,
         "symbol": name,
         "securityId": sid,

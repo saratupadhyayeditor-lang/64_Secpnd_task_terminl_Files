@@ -19,6 +19,7 @@ const ENGINE_LABEL = {
   paper: "Paper Trade",
   paper2: "Paper Trade 2",
   paper3: "Paper Trade 3",
+  paper4: "Equity Indicator Based Trade",
   autoexp: "Auto Experiment",
   aitrader: "AI Trader (Paper)",
   aitraderlive: "AI Trader (Live)",
@@ -26,7 +27,7 @@ const ENGINE_LABEL = {
   equitylive: "Realtime Equity Engine",
 };
 
-const PAPER_ENGINES = ["paper", "paper2", "paper3", "autoexp", "aitrader", "equitypaper"];
+const PAPER_ENGINES = ["paper", "paper2", "paper3", "paper4", "autoexp", "aitrader", "equitypaper"];
 
 let styleInjected = false;
 let mounted = {};
@@ -397,6 +398,7 @@ export function realtimeEngineId() {
     const pb = window.__PAPER_BASE__ || "";
     if (pb.indexOf("/api/paper2") === 0) return "paper2";
     if (pb.indexOf("/api/paper3") === 0) return "paper3";
+    if (pb.indexOf("/api/paper4") === 0) return "paper4";
     if (pb.indexOf("/api/autoexp") === 0) return "autoexp";
     if (pb.indexOf("/api/aitraderlive") === 0) return "aitraderlive";
     if (pb.indexOf("/api/aitrader") === 0) return "aitrader";

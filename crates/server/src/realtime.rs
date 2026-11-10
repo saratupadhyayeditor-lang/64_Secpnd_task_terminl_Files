@@ -70,6 +70,47 @@ fn jarr(v: &Value, k: &str) -> Vec<Value> {
     v.get(k).and_then(|x| x.as_array()).cloned().unwrap_or_default()
 }
 
+/// One ranked row from the daily equity-liquidity scan.
+#[derive(Clone, Debug)]
+struct RankedLiquidity {
+    sid: i64,
+    turnover: f64,
+    growth: Option<f64>,
+    score: f64,
+    last: f64,
+    pct: f64,
+}
+
+/// Score and rank the daily full-universe quote rows for the Equity Indicator
+/// Based Trade book. Score = turnover (₹ crore) x growth boost, where the boost
+/// is `1 + clamp(growth, 0, 3)` so a name is never demoted for shrinking and one
+/// wild growth print cannot dominate. Rows below `min_cr` turnover are dropped.
+///
+/// Pure (no state, no I/O) so the ranking rule is unit-testable; `prev` is the
+/// previous session's turnover map keyed by security id as JSON strings.
+fn rank_liquidity(
+    rows: Vec<(i64, f64, f64, f64)>,
+    prev: Option<&serde_json::Map<String, Value>>,
+    min_cr: f64,
+) -> Vec<RankedLiquidity> {
+    let mut ranked: Vec<RankedLiquidity> = Vec::new();
+    for (sid, turnover, last, pct) in rows {
+        let turnover_cr = turnover / 1e7; // ₹ crore
+        if turnover_cr < min_cr {
+            continue;
+        }
+        let growth = prev
+            .and_then(|m| m.get(&sid.to_string()).and_then(|v| v.as_f64()))
+            .filter(|p| *p > 0.0)
+            .map(|p| turnover / p - 1.0);
+        let boost = 1.0 + growth.unwrap_or(0.0).clamp(0.0, 3.0);
+        let score = turnover_cr * boost;
+        ranked.push(RankedLiquidity { sid, turnover, growth, score, last, pct });
+    }
+    ranked.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    ranked
+}
+
 /// Drop every row whose underlying the Liquid F&O list already shows, so a
 /// common stock is ranked by the Liquid F&O scanner only and never appears in
 /// the Top Movers gainers / losers readout at the same time.
@@ -536,6 +577,19 @@ pub struct Settings {
     /// left to the indicator filters (both legs built, the gate decides), so a
     /// manual add never guesses a direction.
     pub liquid_list: Vec<i64>,
+    // --- Equity Indicator Based Trade (Paper Trade 4) daily liquidity scan ---
+    /// How many of the top-ranked (most-liquid) scanned cash-equity names the
+    /// bullish indicator engine is allowed to trade. The daily scan ranks the
+    /// whole NSE EQ universe, then only the first `liquid_trade_count` rows
+    /// enter the trade universe. Clamped 1..=500.
+    pub liquid_trade_count: i64,
+    /// IST `HH:MM` at which the daily full-universe liquidity scan runs once per
+    /// trading day. A "Scan now" button can force an extra pass at any time.
+    pub liquid_scan_time: String,
+    /// Minimum turnover (in ₹ crore) a stock must show at scan time to be
+    /// eligible. The score already ranks by turnover, so this is a floor that
+    /// keeps the very illiquid names out of the pool. 0 = no floor.
+    pub liquid_scan_min_turnover_cr: f64,
     // --- Liquid F&O AUTO-LOT + SLICING (Realtime + Paper Trade 1 only) ---
     // A dedicated sizing / iceberg config that applies ONLY to legs armed by the
     // Liquid F&O scanner above. Kept separate from the global `auto_lot_*` /
@@ -747,6 +801,14 @@ pub struct Settings {
     /// AI Brain for a score/veto gate). This is the only run mode exposed in the
     /// UI, so it defaults to `true`.
     pub filter_mode: bool,
+    /// Equity-only book (Equity Indicator Based Trade tab). When ON the engine
+    /// trades ONLY liquid NSE cash EQUITY (spot BUY, delivery) - there are no
+    /// indices, no F&O options, no commodities, no strike ladder, no premium
+    /// chart and no option chain. Every entry is gated by the BULLISH indicator
+    /// filters only (bearish filters are inert). Set by
+    /// `sanitize_equity_indicators` and enforced on load/import/POST so a saved
+    /// file can never re-arm an option feature on this tab.
+    pub equity_only: bool,
     /// "Auto Trading" master. When ON, a single click applies a complete,
     /// coordinated trend-following configuration to this tab: NIFTY trend
     /// following (direction from the confirmation indicators), Top Movers as the
@@ -1144,6 +1206,9 @@ impl Default for Settings {
             liquid_gainer: 0,
             liquid_loser: 0,
             liquid_list: Vec::new(),
+            liquid_trade_count: 5,
+            liquid_scan_time: "09:20".into(),
+            liquid_scan_min_turnover_cr: 5.0,
             liquid_auto_lot_on: false,
             liquid_auto_lot_volume_pct: 1.0,
             liquid_auto_lot_oi_pct: 1.0,
@@ -1199,6 +1264,7 @@ impl Default for Settings {
             comm_trend_conf_inds: Vec::new(),
             scanner_exclude: Vec::new(),
             filter_mode: true,
+            equity_only: false,
             auto_trade_on: false,
             brain_sl_atr: 1.5,
             brain_trail_atr: 1.0,
@@ -1965,6 +2031,18 @@ const STATE_FILE_REAL3: &str = "algodhan_realtime3_state.json";
 const STATE_FILE_PAPER: &str = "algodhan_paper_state.json";
 const STATE_FILE_PAPER2: &str = "algodhan_paper2_state.json";
 const STATE_FILE_PAPER3: &str = "algodhan_paper3_state.json";
+/// Equity Indicator Based Trade: an independent paper engine that trades ONLY
+/// liquid NSE cash EQUITY (spot, delivery CNC) - no indices, no F&O options, no
+/// commodities, no strikes / premiums / option chain. It is gated by the
+/// BULLISH indicator filters ONLY (bearish filters have no function). Its own
+/// durable state file and in-memory book; shares NO data with any other engine.
+const STATE_FILE_PAPER4: &str = "algodhan_paper4_state.json";
+/// Durable cache of the daily full-universe cash-equity liquidity scan (the
+/// ranked stock list + the per-day turnover baseline the growth score needs).
+/// Kept on disk so a restart does not lose the day's scan and the previous
+/// session's turnover baseline, which would otherwise take two trading days to
+/// rebuild the growth comparison.
+const EQUITY_LIQUIDITY_FILE: &str = "algodhan_equity_liquidity_scan.json";
 /// Auto Experiment: a complete, fully independent clone of Paper Trade (all
 /// universes: stocks + indices + option-chain commodities) that shares NO data
 /// with any other engine - its own durable state file and in-memory book.
@@ -2058,6 +2136,7 @@ pub fn shared_template_pool() -> TemplatePool {
             (STATE_FILE_PAPER, "paper", "Paper Trade"),
             (STATE_FILE_PAPER2, "paper2", "Paper Trade 2"),
             (STATE_FILE_PAPER3, "paper3", "Paper Trade 3"),
+            (STATE_FILE_PAPER4, "paper4", "Equity Indicator Based Trade"),
             (STATE_FILE_AUTOEXP, "autoexp", "Auto Experiment"),
             (STATE_FILE_AITRADER, "aitrader", "AI Trader (Paper)"),
             (STATE_FILE_AITRADERLIVE, "aitraderlive", "AI Trader (Live)"),
@@ -2198,6 +2277,65 @@ fn sanitize_commodities_only(s: &mut Settings) {
     s.movers_index_legs.clear();
     s.index_trend_on = false;
     s.index_trend_conf_inds.clear();
+}
+
+/// Equity Indicator Based Trade (Paper Trade 4) is a **liquid NSE cash equity
+/// only** book: no indices, no F&O option strikes, no commodities, no premium
+/// chart, no option chain. Every entry is gated by the BULLISH indicator filters
+/// ONLY, so this sanitizer:
+///   * pins the equity-only flag ON (so the run/trade path stays on spot),
+///   * strips every index / commodity / option-strike / premium scanner field,
+///   * keeps ONLY bullish indicator filters ticked (bearish filters, primary
+///     filters and any option-leg routing are cleared or ignored).
+/// It runs on load, import and settings POST so a saved file or a hand-written
+/// API call can never re-arm a removed option feature on this tab.
+fn sanitize_equity_indicators(s: &mut Settings) {
+    s.equity_only = true;
+    // No indices / commodities / Top Movers indices.
+    s.movers_on = false;
+    s.movers_indices.clear();
+    s.movers_index_legs.clear();
+    s.commodity_on = false;
+    s.commodity_list.clear();
+    s.commodity_legs.clear();
+    s.index_trend_on = false;
+    s.index_trend_conf_inds.clear();
+    s.comm_trend_on = false;
+    s.comm_trend_conf_inds.clear();
+    s.nifty_trend_on = false;
+    s.nifty_trend_pct_on = false;
+    s.nifty_trend_conf_inds.clear();
+    s.bbpct_pane_on = false;
+    s.bbpct_zone_on = false;
+    s.bbpct_trend_on = false;
+    s.bbpct_combo_on = false;
+    // No strike ladder / premium routing / manual strikes / +green legs.
+    s.manual_strikes_enabled = false;
+    s.manual_strikes.clear();
+    s.only_positive = false;
+    s.fastest_rising = false;
+    s.premium_only = false;
+    // Everything runs AND trades on the cash spot chart.
+    s.run_index = "spot".into();
+    s.run_fno = "spot".into();
+    s.run_comm = "spot".into();
+    s.trade_in_index = "spot".into();
+    s.trade_in_fno = "spot".into();
+    s.trade_in_comm = "spot".into();
+    // Bullish-only gate: drop every ticked bearish filter, the bearish primary
+    // set, and any bearish leg pin so only bullish filters can gate an entry.
+    s.filters.retain(|k, v| !*v || filter_is_bull(k));
+    s.entry_primary_filters.retain(|k| filter_is_bull(k));
+    s.option_side = "CE".into();
+    // The daily cash-equity liquidity scan is this book's universe; leave its
+    // master (`liquid_on`) and trade-count in the operator's control but keep
+    // them inside a sane band.
+    s.liquid_trade_count = s.liquid_trade_count.clamp(1, 500);
+    if hhmm_to_minutes(&s.liquid_scan_time).is_none() {
+        s.liquid_scan_time = "09:20".into();
+    }
+    s.liquid_scan_min_turnover_cr = s.liquid_scan_min_turnover_cr.max(0.0);
+    s.filter_mode = true;
 }
 
 // ---------------------------------------------------------------------------
@@ -2356,6 +2494,22 @@ pub struct RealtimeState {
     liquid_cache: Arc<Mutex<(i64, Value)>>,
     /// Last Liquid-F&O scan (ms), throttled like the Top Movers pass.
     last_liquid: Arc<AtomicI64>,
+    /// Daily full-universe cash-equity liquidity scan result for the Equity
+    /// Indicator Based Trade book `(at_ms, payload)`. The payload carries the
+    /// ranked stock rows (`stocks`), the scan timestamp and the day-key it was
+    /// computed for (`day`), so the engine only reruns it once per IST day (or
+    /// when the operator forces a refresh). Deliberately separate from
+    /// `liquid_cache`, which the F&O engines rank by intraday gainers/losers.
+    equity_liquidity_cache: Arc<Mutex<(i64, Value)>>,
+    /// Guard so the (heavy) full-universe liquidity scan can never run twice
+    /// concurrently.
+    equity_liquidity_busy: Arc<AtomicBool>,
+    /// Set by the "Scan now" button: forces the next liquidity scan to run even
+    /// before the daily scan time (or after it already ran today).
+    equity_liquidity_force: Arc<AtomicBool>,
+    /// Last daily equity-liquidity scan attempt (ms), its own cadence clock so it
+    /// never fights the F&O Liquid scanner's `last_liquid` throttle.
+    last_equity_liquidity: Arc<AtomicI64>,
     /// Pre-scanned "Leg Book": per Top-Movers underlying (keyed by its security
     /// id) the green + fastest-rising strike resolved once when the stock is
     /// picked. Entries are frozen and reused by every entry until the pick, its
@@ -2916,6 +3070,7 @@ fn register_engine(state_file: &'static str, st: &RealtimeState) {
         STATE_FILE_PAPER => "paper",
         STATE_FILE_PAPER2 => "paper2",
         STATE_FILE_PAPER3 => "paper3",
+        STATE_FILE_PAPER4 => "paper4",
         STATE_FILE_AUTOEXP => "autoexp",
         STATE_FILE_AITRADER => "aitrader",
         STATE_FILE_AITRADERLIVE => "aitraderlive",
@@ -2928,7 +3083,7 @@ fn register_engine(state_file: &'static str, st: &RealtimeState) {
 
 /// Every registered engine id, in tab order.
 pub fn rt_engine_ids() -> Vec<&'static str> {
-    vec!["realtime", "realtime2", "realtime3", "paper", "paper2", "paper3", "autoexp", "aitrader", "aitraderlive"]
+    vec!["realtime", "realtime2", "realtime3", "paper", "paper2", "paper3", "paper4", "autoexp", "aitrader", "aitraderlive"]
 }
 
 impl RealtimeState {
@@ -2957,6 +3112,15 @@ impl RealtimeState {
     /// own simulated trades and shares NO data with any other engine.
     pub fn new_paper3(dhan: DhanState) -> Self {
         Self::new_mode(dhan, true, STATE_FILE_PAPER3)
+    }
+
+    /// Equity Indicator Based Trade (`/api/paper4/*`): an independent paper
+    /// engine that trades ONLY liquid NSE cash EQUITY (spot, delivery) and is
+    /// gated by the BULLISH indicator filters only. No indices, no F&O options,
+    /// no commodities, no strikes / premium chart / option chain. Own durable
+    /// state file and in-memory book - shares NO data with any other engine.
+    pub fn new_paper4(dhan: DhanState) -> Self {
+        Self::new_mode(dhan, true, STATE_FILE_PAPER4)
     }
 
     /// Auto Experiment engine (`/api/autoexp/*`): a complete, fully independent
@@ -3015,6 +3179,7 @@ impl RealtimeState {
             STATE_FILE_PAPER => "paper",
             STATE_FILE_PAPER2 => "paper2",
             STATE_FILE_PAPER3 => "paper3",
+            STATE_FILE_PAPER4 => "paper4",
             STATE_FILE_AUTOEXP => "autoexp",
             STATE_FILE_AITRADER => "aitrader",
             STATE_FILE_AITRADERLIVE => "aitraderlive",
@@ -3031,6 +3196,7 @@ impl RealtimeState {
             STATE_FILE_PAPER => "Paper Trade",
             STATE_FILE_PAPER2 => "Paper Trade 2",
             STATE_FILE_PAPER3 => "Paper Trade 3",
+            STATE_FILE_PAPER4 => "Equity Indicator Based Trade",
             STATE_FILE_AUTOEXP => "Auto Experiment",
             STATE_FILE_AITRADER => "AI Trader (Paper)",
             STATE_FILE_AITRADERLIVE => "AI Trader (Live)",
@@ -3064,6 +3230,14 @@ impl RealtimeState {
         matches!(self.state_file, STATE_FILE_PAPER3)
     }
 
+    /// True for the Equity Indicator Based Trade engine (Paper Trade 4): it
+    /// trades only liquid NSE cash equity (spot, delivery) and is gated by the
+    /// bullish indicator filters only. There are no indices, no F&O options, no
+    /// commodities, no strikes and no premium chart on this book.
+    fn equity_indicators_only(&self) -> bool {
+        matches!(self.state_file, STATE_FILE_PAPER4)
+    }
+
     /// True for the Auto Experiment engine: the "Auto Trading (trend + SL +
     /// trail + target)" preset is removed from this tab only. A saved file or a
     /// settings POST can never arm it here; every other engine keeps the feature.
@@ -3081,20 +3255,23 @@ impl RealtimeState {
         matches!(self.state_file, STATE_FILE_AITRADER | STATE_FILE_AITRADERLIVE)
     }
 
-    /// Whether the operator's index universe is part of this engine's scan.
+    /// Whether the operator's index universe is part of this engine's scan. The
+    /// equity-only book has no indices at all.
     fn allows_indices(&self) -> bool {
-        !self.commodities_only()
+        !self.commodities_only() && !self.equity_indicators_only()
     }
 
     /// Whether the operator's commodity universe is part of this engine's scan.
+    /// The equity-only book has no commodities at all.
     fn allows_commodities(&self) -> bool {
-        !self.indices_only()
+        !self.indices_only() && !self.equity_indicators_only()
     }
 
     /// Whether the Liquid F&O stock scanner belongs to this engine. Like the
     /// Top Movers stock scan, only the full engines (Realtime Trading Engine and
     /// Paper Trade 1) carry it - the indices-only / commodities-only books do
-    /// not, and neither do RT2/RT3.
+    /// not, and neither do RT2/RT3. The equity-only book DOES carry a stock
+    /// scanner (its entire universe is stocks), so it is allowed here too.
     fn allows_liquid_stocks(&self) -> bool {
         !self.indices_commodities_only()
     }
@@ -3153,7 +3330,9 @@ impl RealtimeState {
             s.auto_trade_on = true;
             s.filter_mode = true;
         }
-        if self.indices_commodities_only() {
+        if self.equity_indicators_only() {
+            sanitize_equity_indicators(s);
+        } else if self.indices_commodities_only() {
             sanitize_indices_commodities(s);
             if self.indices_only() {
                 sanitize_indices_only(s);
@@ -3208,6 +3387,9 @@ impl RealtimeState {
         // option-chain commodities only: strip the stock scanner, NIFTY Trend
         // Following and the BB%b pane a saved file may carry.
         match state_file {
+            STATE_FILE_PAPER4 => {
+                sanitize_equity_indicators(&mut doc.settings);
+            }
             STATE_FILE_PAPER2
             | STATE_FILE_PAPER3
             | STATE_FILE_REAL2
@@ -3296,6 +3478,10 @@ impl RealtimeState {
             movers_cache: Arc::new(Mutex::new((0, Value::Null))),
             liquid_cache: Arc::new(Mutex::new((0, Value::Null))),
             last_liquid: Arc::new(AtomicI64::new(0)),
+            equity_liquidity_cache: Arc::new(Mutex::new((0, Value::Null))),
+            equity_liquidity_busy: Arc::new(AtomicBool::new(false)),
+            equity_liquidity_force: Arc::new(AtomicBool::new(false)),
+            last_equity_liquidity: Arc::new(AtomicI64::new(0)),
             leg_book: Arc::new(Mutex::new(HashMap::new())),
             nifty_dir: Arc::new(AtomicI64::new(0)),
             nifty_sideways: Arc::new(AtomicBool::new(false)),
@@ -3668,7 +3854,22 @@ impl RealtimeState {
         let this = self.clone();
         let (inst, tf) = (inst.to_string(), tf.to_string());
         let (exch, key2) = (exch.to_string(), key);
+        // Bound the number of seeds queued on the Dhan data gate. When the budget
+        // is full this pass is skipped (the key is removed below) so the scanner
+        // retries on its next tick; that keeps the gate's reservation horizon
+        // short enough that an operator chart request never starves behind a wall
+        // of background seeds.
+        let slot = match this.dhan.try_seed_slot() {
+            Some(s) => s,
+            None => {
+                if let Ok(mut g) = this.seed_inflight.lock() {
+                    g.remove(&key2);
+                }
+                return;
+            }
+        };
         tokio::spawn(async move {
+            let _slot = slot;
             if !this.dhan.rate_limited() {
                 if let Ok(c) = this.dhan.fetch_candles(sec_id, &exch, &inst, &tf).await {
                     this.dhan.market.seed_bars(sec_id, &exch, &tf, c);
@@ -4697,6 +4898,7 @@ impl RealtimeState {
                 if !manual && !self.scanner_busy.swap(true, Ordering::AcqRel) {
                     self.refresh_movers().await;
                     self.refresh_liquid().await;
+                    self.refresh_equity_liquidity(false).await;
                     self.refresh_nifty_trend().await;
                     self.refresh_nifty_scan().await;
                     self.refresh_commodity_picked().await;
@@ -5522,9 +5724,379 @@ impl RealtimeState {
     /// is a stock whose options actually trade. Mirrors the Top Movers payload
     /// shape (`gainers` / `losers` / `bias`) so the UI can reuse its chip
     /// renderer, and also returns the operator's manual adds.
+    /// Full NSE cash-equity universe from the scrip master: `(security id,
+    /// symbol, exchange segment)`. Only genuine `EQUITY` / series `EQ` rows on
+    /// NSE are returned - no indices, no F&O, no BSE duplicates. Returns an
+    /// empty list while the master is still warming.
+    fn equity_universe() -> Vec<(i64, String, String)> {
+        let Some(sc) = scrip::get() else { return Vec::new() };
+        let mut out: Vec<(i64, String, String)> = Vec::new();
+        for sid in sc.contract_ids() {
+            let Some(c) = sc.contract(sid) else { continue };
+            if !c.exchange.eq_ignore_ascii_case("NSE") {
+                continue;
+            }
+            if !(c.instrument.eq_ignore_ascii_case("EQUITY") || c.instrument.eq_ignore_ascii_case("EQ")) {
+                continue;
+            }
+            if c.underlying.trim().is_empty() {
+                continue;
+            }
+            out.push((sid, c.underlying.clone(), "NSE_EQ".to_string()));
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Chunked `/marketfeed/quote` walk over a large universe. Returns
+    /// `(security id, turnover ₹, last price, change %)` per resolved row.
+    /// Turnover uses the session VWAP (`average_price`) when Dhan sends it, else
+    /// the last traded price. Rate-limit holds stop the pass early instead of
+    /// paying the hold for every remaining chunk.
+    async fn equity_turnover_rows(&self, univ: &[(i64, String)]) -> Vec<(i64, f64, f64, f64)> {
+        let Some(client) = self.dhan.session_client().await else {
+            self.log_throttled(
+                "equity-liquidity-nosession",
+                60_000,
+                "warn",
+                "equity liquidity scan: no Dhan session client",
+            );
+            return Vec::new();
+        };
+        let mut out: Vec<(i64, f64, f64, f64)> = Vec::with_capacity(univ.len());
+        // Dhan's market-quote endpoint takes up to 1000 instruments per call, so
+        // the whole NSE EQ universe (~1100-1200 names) needs only two requests
+        // instead of a dozen. Fewer calls = less time queued behind the shared
+        // 1.2s data gate = a scan that finishes in seconds, not minutes.
+        for chunk in univ.chunks(1000) {
+            // Wait out an adaptive rate-hold instead of aborting the sweep: a
+            // manual scan must return the COMPLETE universe, and breaking here
+            // would silently rank only the chunks fetched before the 429.
+            while self.dhan.rate_limited() {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            let mut req: BTreeMap<String, Vec<i64>> = BTreeMap::new();
+            for (sid, _sym) in chunk {
+                req.entry("NSE_EQ".to_string()).or_default().push(*sid);
+            }
+            self.dhan.dhan_throttle().await;
+            match client.market_feed_quote(&req).await {
+                Ok(resp) => {
+                    self.dhan.note_data_ok();
+                    for (_seg, m) in resp.iter() {
+                        for (sid, q) in m.iter() {
+                            let Ok(sid) = sid.parse::<i64>() else { continue };
+                            let px = if q.average_price > 0.0 { q.average_price } else { q.last_price };
+                            if px <= 0.0 || q.volume <= 0.0 {
+                                continue;
+                            }
+                            let turnover = px * q.volume;
+                            let prev = q
+                                .ohlc
+                                .as_ref()
+                                .map(|o| o.close)
+                                .filter(|c| *c > 0.0)
+                                .unwrap_or_else(|| (q.last_price - q.net_change).max(0.0));
+                            let pct = if prev > 0.0 { (q.last_price - prev) / prev * 100.0 } else { 0.0 };
+                            out.push((sid, turnover, q.last_price, pct));
+                        }
+                    }
+                }
+                Err(e) => {
+                    if e.is_rate_limit() {
+                        self.dhan.note_rate_limited();
+                    }
+                    self.log_throttled(
+                        "equity-liquidity-quote-failed",
+                        30_000,
+                        "warn",
+                        &format!("equity liquidity scan quote failed ({} ids): {e}", chunk.len()),
+                    );
+                }
+            }
+        }
+        let mut seed: Vec<Value> = Vec::with_capacity(out.len());
+        for (sid, _t, last, pct) in &out {
+            seed.push(json!({ "securityId": sid, "segment": "NSE_EQ", "last": last, "changePct": pct, "volume": 0.0 }));
+        }
+        self.seed_ltp_from_rows(&seed);
+        out
+    }
+
+    /// Daily full-universe cash-equity liquidity scan for the Equity Indicator
+    /// Based Trade book. Ranks the whole NSE EQ universe by a **turnover +
+    /// growth** score (today's turnover ₹ crore, boosted by the same-time growth
+    /// versus the previous scan day), persists the per-day turnover baseline so
+    /// the growth comparison survives a restart, and publishes the ranked rows
+    /// to `equity_liquidity_cache` for the dropdown and the trade universe.
+    ///
+    /// It runs at most once per IST day at `liquid_scan_time` (or when the
+    /// operator forces "Scan now"), never concurrently, and is a no-op for every
+    /// non-equity engine.
+    async fn refresh_equity_liquidity(&self, force: bool) {
+        let settings = match self.doc() {
+            Some(d) => d.settings.clone(),
+            None => return,
+        };
+        if !(self.equity_indicators_only() || settings.equity_only) {
+            return;
+        }
+        // The scheduled scan belongs to the armed universe; when the liquid
+        // master is OFF an automatic pass would just burn Dhan data slots for a
+        // list nobody trades. A forced "Scan now" still runs so the operator can
+        // preview the ranking before arming.
+        let forced = force || self.equity_liquidity_force.load(Ordering::Relaxed);
+        if !settings.liquid_on && !forced {
+            return;
+        }
+        let now = now_ms();
+        if !force && now - self.last_equity_liquidity.load(Ordering::Relaxed) < 30_000 {
+            return;
+        }
+        let today = ist_day_key();
+        // Rehydrate from disk on the first pass after a restart: if today's scan
+        // was already persisted, restore it so the dropdown fills without paying
+        // for a fresh full-universe scan (the day-key guard then sees it done).
+        {
+            let empty = self
+                .equity_liquidity_cache
+                .lock()
+                .map(|g| g.1.as_object().map(|o| o.get("stocks").and_then(|v| v.as_array()).map(|a| a.is_empty()).unwrap_or(true)).unwrap_or(true))
+                .unwrap_or(false);
+            if empty {
+                if let Ok(s) = std::fs::read_to_string(state_path(EQUITY_LIQUIDITY_FILE)) {
+                    if let Ok(v) = serde_json::from_str::<Value>(&s) {
+                        if v.get("day").and_then(|d| d.as_str()) == Some(today.as_str())
+                            && v.get("stocks").and_then(|d| d.as_array()).map(|a| !a.is_empty()).unwrap_or(false)
+                        {
+                            let at = v.get("at").and_then(|d| d.as_i64()).unwrap_or(now);
+                            let mut payload = v.clone();
+                            if let Some(o) = payload.as_object_mut() {
+                                o.insert("ok".into(), json!(true));
+                            }
+                            if let Ok(mut c) = self.equity_liquidity_cache.lock() {
+                                *c = (at, payload);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Decide whether a scan is due: forced, or the cache was not computed on
+        // the current IST day and the clock has reached the operator's scan time.
+        let scan_day = {
+            let c = self.equity_liquidity_cache.lock().map(|g| g.1.clone()).unwrap_or(Value::Null);
+            c.get("day").and_then(|v| v.as_str()).unwrap_or("").to_string()
+        };
+        let due = force
+            || self.equity_liquidity_force.swap(false, Ordering::AcqRel)
+            || (scan_day != today
+                && hhmm_to_minutes(&settings.liquid_scan_time)
+                    .map(|m| ist_minutes() >= m)
+                    .unwrap_or(true));
+        if !due {
+            // Publish a "scheduled" payload so the UI can show when the next scan
+            // will run instead of an empty dropdown. Deliberately carries NO
+            // `day` key: stamping the day here would make the due check believe
+            // today's scan already ran and never fire it.
+            if let Ok(mut c) = self.equity_liquidity_cache.lock() {
+                if !c.1.is_object() {
+                    *c = (
+                        now,
+                        json!({
+                            "ok": true,
+                            "on": settings.liquid_on,
+                            "at": now,
+                            "scheduled": settings.liquid_scan_time,
+                            "stocks": [],
+                        }),
+                    );
+                }
+            }
+            return;
+        }
+        if self.equity_liquidity_busy.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        // RAII guard: whatever happens (request cancelled, Dhan timeout, early
+        // return) the busy flag is released, so one aborted scan can never wedge
+        // every future scan behind a stuck flag.
+        struct BusyGuard(Arc<AtomicBool>);
+        impl Drop for BusyGuard {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _busy = BusyGuard(self.equity_liquidity_busy.clone());
+        let payload = self.equity_liquidity_scan(&settings, &today).await;
+        self.last_equity_liquidity.store(now_ms(), Ordering::Relaxed);
+        match payload {
+            Some(p) => {
+                if let Ok(mut c) = self.equity_liquidity_cache.lock() {
+                    *c = (now, p);
+                }
+            }
+            None => {
+                // Empty scan (master still warming / no data): remember the
+                // attempt so the loop does not hammer REST every tick, but do
+                // NOT stamp a day-key (so the next tick can retry once the
+                // master is ready or the feed is up).
+                if let Ok(mut c) = self.equity_liquidity_cache.lock() {
+                    *c = (
+                        now,
+                        json!({
+                            "ok": true,
+                            "on": settings.liquid_on,
+                            "at": now,
+                            "waiting": "scrip",
+                            "stocks": [],
+                        }),
+                    );
+                }
+            }
+        }
+    }
+
+    /// The heavy part of [`refresh_equity_liquidity`]: build the universe, fetch
+    /// quotes, apply the turnover + growth score and persist the baseline. Split
+    /// out so the caller owns the busy-flag lifecycle.
+    async fn equity_liquidity_scan(&self, settings: &Settings, today: &str) -> Option<Value> {
+        let univ = Self::equity_universe();
+        if univ.is_empty() {
+            self.log_throttled(
+                "equity-liquidity-nowarm",
+                60_000,
+                "warn",
+                "equity liquidity scan: scrip master not ready (no NSE EQ rows)",
+            );
+            return None;
+        }
+        let rows = self
+            .equity_turnover_rows(&univ.iter().map(|(sid, sym, _)| (*sid, sym.clone())).collect::<Vec<_>>())
+            .await;
+        if rows.is_empty() {
+            return None;
+        }
+        // Load the persisted baseline. `cur` is the turnover map captured on the
+        // last scan day; on a NEW day it becomes the previous-session baseline
+        // (`prev`), which is what the growth score compares against.
+        let path = state_path(EQUITY_LIQUIDITY_FILE);
+        let file = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+            .unwrap_or(Value::Null);
+        let file_day = file.get("day").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if file_day != today {
+            // Roll: yesterday's captured turnovers become the baseline.
+            let prev = file.get("cur").cloned().unwrap_or(json!({}));
+            let mut merged = file.clone();
+            if let Some(o) = merged.as_object_mut() {
+                o.insert("prev".into(), prev);
+            }
+            return self.equity_liquidity_score(settings, today, rows, &merged);
+        }
+        self.equity_liquidity_score(settings, today, rows, &file)
+    }
+
+    /// Apply the turnover + growth score to the freshly fetched quote rows and
+    /// persist the new ``{day, prev, cur}`` baseline. Pure-ish: the only side
+    /// effect is the atomic file write.
+    fn equity_liquidity_score(
+        &self,
+        settings: &Settings,
+        today: &str,
+        rows: Vec<(i64, f64, f64, f64)>,
+        baseline: &Value,
+    ) -> Option<Value> {
+        let prev_map = baseline.get("prev").and_then(|v| v.as_object());
+        let min_cr = settings.liquid_scan_min_turnover_cr.max(0.0);
+        let names: HashMap<i64, String> = Self::equity_universe()
+            .into_iter()
+            .map(|(sid, sym, _)| (sid, sym))
+            .collect();
+        // The raw turnover capture (for tomorrow's baseline) is kept even for
+        // names below the floor, so the growth comparison is complete next day.
+        let mut cur_map = serde_json::Map::new();
+        for (sid, turnover, _last, _pct) in &rows {
+            cur_map.insert(sid.to_string(), json!(turnover));
+        }
+        let ranked = rank_liquidity(rows, prev_map, min_cr);
+        let stocks: Vec<Value> = ranked
+            .iter()
+            .take(500)
+            .map(|r| {
+                json!({
+                    "securityId": r.sid,
+                    "name": names.get(&r.sid).cloned().unwrap_or_default(),
+                    "segment": "NSE_EQ",
+                    "instrument": "EQUITY",
+                    "turnoverCr": round2(r.turnover / 1e7),
+                    "growthPct": r.growth.map(|g| round2(g * 100.0)),
+                    "score": round2(r.score),
+                    "last": round2(r.last),
+                    "changePct": round2(r.pct),
+                })
+            })
+            .collect();
+        // Persist the rolling baseline: `prev` stays the prior-session map, `cur`
+        // becomes this scan's turnover map so TOMORROW's scan can compare. The
+        // ranked `stocks` are stored too so a restart can rehydrate the dropdown
+        // without re-scanning (the day-key guard then sees today's scan as done).
+        let prev_obj = baseline.get("prev").cloned().unwrap_or(json!({}));
+        let out_file = json!({
+            "day": today,
+            "at": now_ms(),
+            "prev": prev_obj,
+            "cur": Value::Object(cur_map),
+            "stocks": stocks,
+            "scanned": ranked.len(),
+            "tradeCount": settings.liquid_trade_count,
+            "minTurnoverCr": min_cr,
+        });
+        if let Ok(bytes) = serde_json::to_vec(&out_file) {
+            let _ = write_atomic(&state_path(EQUITY_LIQUIDITY_FILE), &bytes);
+        }
+        self.log_throttled(
+            "equity-liquidity-scanned",
+            5_000,
+            "info",
+            &format!(
+                "equity liquidity scan: {} quotes, {} ranked, top-{} armed",
+                ranked.len(),
+                stocks.len(),
+                settings.liquid_trade_count
+            ),
+        );
+        Some(json!({
+            "ok": true,
+            "on": settings.liquid_on,
+            "at": now_ms(),
+            "day": today,
+            "scannedAt": now_ms(),
+            "scanned": ranked.len(),
+            "tradeCount": settings.liquid_trade_count,
+            "minTurnoverCr": min_cr,
+            "stocks": stocks,
+        }))
+    }
+
     async fn refresh_liquid(&self) {
         let now = now_ms();
         if now - self.last_liquid.load(Ordering::Relaxed) < 250 {
+            return;
+        }
+        // The Equity Indicator Based Trade book has NO Liquid-F&O option scanner:
+        // its universe is the daily cash-equity liquidity scan. Running the old
+        // gainers/losers -> pick_legs resolver here is exactly what made the
+        // equity tab show option strikes (YESBANK CE, ...). Publish an inert
+        // payload instead (the equity scan owns `equity_liquidity_cache`).
+        if self.equity_indicators_only()
+            || self.doc().map(|d| d.settings.equity_only).unwrap_or(false)
+        {
+            self.update_picked("Liquid F&O", Vec::new());
+            if let Ok(mut c) = self.liquid_cache.lock() {
+                *c = (now, json!({ "ok": true, "on": false, "gainers": [], "losers": [], "added": [], "bias": 0, "equity": true }));
+            }
             return;
         }
         // The Liquid F&O scanner belongs to the full engines (Realtime Trading
@@ -5633,6 +6205,12 @@ impl RealtimeState {
         if let Ok(mut c) = self.liquid_cache.lock() {
             *c = (now, payload);
         }
+        // Refresh the shared stock Leg Book from the freshly-ranked liquid rows
+        // (the Top Movers pass feeds the same book from its own lists). Passing
+        // empty mover lists keeps this correct even when the movers master is off
+        // but the Liquid F&O master is on.
+        let settings = self.doc().map(|d| d.settings.clone()).unwrap_or_default();
+        self.refresh_leg_book(&settings);
         self.refresh_liquid_picked().await;
     }
 
@@ -5793,10 +6371,10 @@ impl RealtimeState {
         // picks instead of leaving them beside the fresh ones. When no direction
         // is decided both legs are shown.
         let settings = self.doc().map(|d| d.settings.clone()).unwrap_or_default();
-        // Maintain the Leg Book before the readout: each selected mover is
-        // pre-scanned ONCE (green + fastest rising) and the Picked Strikes rows
-        // below then resolve straight from that frozen leg.
-        self.refresh_leg_book(&settings, &gainers, &losers);
+        // Maintain the Leg Book before the readout: each selected mover (and each
+        // Liquid F&O pick) is pre-scanned ONCE (green + fastest rising) and the
+        // Picked Strikes rows below then resolve straight from that frozen leg.
+        self.refresh_leg_book(&settings);
         // Leg scoping removed: both gainer (CE) and loser (PE) rows always show.
         let active: Option<&str> = None;
         let mut legs: Vec<Value> = Vec::new();
@@ -7251,17 +7829,20 @@ impl RealtimeState {
     /// populated, still-valid book costs a handful of map lookups and issues NO
     /// new scan, so the engine never re-checks "is this strike green / fastest" on
     /// the hot path.
-    /// Whether the Top-Movers Leg Book is live: the scanner is on, this engine
-    /// carries F&O stocks (not the indices / commodities-only Paper Trade 2), and
-    /// a strike preference ("Only +green" / "Pick fastest rising") is on. While
-    /// live, F&O stock legs are sourced strictly from the frozen pick.
+    /// Whether the stock Leg Book is live: a stock scanner (Top Movers OR Liquid
+    /// F&O) is on, this engine carries F&O stocks (not the indices /
+    /// commodities-only Paper Trade 2/3), and a strike preference ("Only +green"
+    /// / "Pick fastest rising") is on. While live, F&O stock legs are sourced
+    /// strictly from the frozen pick - and BOTH scanners feed that same book, so
+    /// a liquid F&O stock resolves exactly like a Top Mover (bullish -> CE,
+    /// bearish -> PE).
     fn leg_book_active(&self, settings: &Settings) -> bool {
-        settings.movers_on
+        (settings.movers_on || settings.liquid_on)
             && !self.indices_commodities_only()
             && (settings.only_positive || settings.fastest_rising)
     }
 
-    fn refresh_leg_book(&self, settings: &Settings, gainers: &[Value], losers: &[Value]) {
+    fn refresh_leg_book(&self, settings: &Settings) {
         // No Leg Book is needed when the scanner is off, this book only trades
         // indices/commodities, or neither preference is on (the engine then uses
         // the plain nearest-ATM strike).
@@ -7274,13 +7855,63 @@ impl RealtimeState {
         // Leg scoping removed: both legs are always kept.
         let active: Option<&str> = None;
         let mut desired: Vec<(i64, String, f64, String, String, String)> = Vec::new();
-        for (side, list) in [("CE", gainers), ("PE", losers)] {
+        // Unified feed: Top Movers gainers/losers AND Liquid F&O gainers/losers
+        // populate the SAME Leg Book, so a liquid stock resolves exactly like a
+        // Top Mover (bullish filter -> CE from a top gainer, bearish -> PE from a
+        // top loser). Sourcing both from their caches here (rather than from a
+        // parameter) means either scanner pass refreshes the whole book without
+        // pruning the other pass's legs. Manual liquid adds are
+        // direction-agnostic, so they are excluded here and resolved by the trend
+        // side at entry time.
+        let movers = self
+            .movers_cache
+            .lock()
+            .map(|g| g.1.clone())
+            .unwrap_or(Value::Null);
+        let liquid = self
+            .liquid_cache
+            .lock()
+            .map(|g| g.1.clone())
+            .unwrap_or(Value::Null);
+        let mover_gainers: Vec<Value> = if settings.movers_on {
+            jarr(&movers, "gainers").into_iter().collect()
+        } else {
+            Vec::new()
+        };
+        let mover_losers: Vec<Value> = if settings.movers_on {
+            jarr(&movers, "losers").into_iter().collect()
+        } else {
+            Vec::new()
+        };
+        let liquid_gainers: Vec<Value> = if settings.liquid_on {
+            jarr(&liquid, "gainers").into_iter().collect()
+        } else {
+            Vec::new()
+        };
+        let liquid_losers: Vec<Value> = if settings.liquid_on {
+            jarr(&liquid, "losers").into_iter().collect()
+        } else {
+            Vec::new()
+        };
+        let mut seen_sides: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        for (side, list) in [
+            ("CE", mover_gainers.as_slice()),
+            ("PE", mover_losers.as_slice()),
+            ("CE", liquid_gainers.as_slice()),
+            ("PE", liquid_losers.as_slice()),
+        ] {
             if active.is_some() && active != Some(side) {
                 continue;
             }
             for r in list {
                 let sid = ji(r, "securityId");
                 if sid <= 0 {
+                    continue;
+                }
+                // A stock that already holds a frozen leg this pass keeps it (the
+                // first ranking wins); a manual add that shows on both legs is
+                // skipped so the frozen side is never ambiguous.
+                if !seen_sides.insert(sid) {
                     continue;
                 }
                 // Operator-assigned indices / commodities keep their own explicit
@@ -7292,7 +7923,17 @@ impl RealtimeState {
                 if settings.commodity_on && seg.eq_ignore_ascii_case("MCX_COMM") {
                     continue;
                 }
-                desired.push((sid, side.to_string(), jf(r, "last"), name, seg, inst));
+                // `last` is absent on a not-yet-quoted liquid row; fall back to the
+                // live cache so the ATM centring still has a spot.
+                let spot = {
+                    let l = jf(r, "last");
+                    if l > 0.0 {
+                        l
+                    } else {
+                        self.ltp_of(sid, &seg)
+                    }
+                };
+                desired.push((sid, side.to_string(), spot, name, seg, inst));
             }
         }
         let desired_ids: std::collections::HashSet<i64> = desired.iter().map(|d| d.0).collect();
@@ -7448,7 +8089,203 @@ impl RealtimeState {
         }
     }
 
+    /// Equity-only scanner universe for the Equity Indicator Based Trade tab.
+    /// It builds one plain spot BUY strategy per name from the DAILY liquidity
+    /// scan's ranked stock list (the `liquid_trade_count` most-liquid NSE cash
+    /// equities by turnover + growth) plus the operator's hand-added names. The
+    /// ticked BULLISH indicator filters are the whole entry rule; bearish filters
+    /// have no function here. There is no option leg, strike, premium or index.
+    fn equity_scanner_targets(&self, settings: &Settings) -> Vec<Strategy> {
+        // The equity universe is armed by the liquid master. The book only ever
+        // trades the bullish side, so when no bullish filter is ticked there is
+        // nothing to gate an entry either.
+        if !settings.liquid_on {
+            return Vec::new();
+        }
+        let bull_on = settings.filters.iter().any(|(k, v)| *v && filter_is_bull(k))
+            || primary_keys_for_side(settings, true).iter().any(|k| filter_is_bull(k));
+        if !bull_on {
+            return Vec::new();
+        }
+        // The trade universe is the daily liquidity scan's ranked list, capped at
+        // the operator's "number of stocks to trade". Fall back to the liquid
+        // index basket only until the first scan lands, so an armed engine is
+        // never silently dead on the first tick.
+        let excluded: std::collections::HashSet<i64> =
+            settings.scanner_exclude.iter().copied().collect();
+        let ranked: Vec<(i64, Option<String>)> = {
+            let payload = self.equity_liquidity_cache.lock().map(|g| g.1.clone()).unwrap_or(Value::Null);
+            jarr(&payload, "stocks")
+                .iter()
+                .map(|r| {
+                    let sid = ji(r, "securityId");
+                    let name = r.get("name").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(|s| s.to_string());
+                    (sid, name)
+                })
+                .collect()
+        };
+        let take_n = settings.liquid_trade_count.clamp(0, 500) as usize;
+        let mut picks: Vec<(i64, Option<String>)> = Vec::new();
+        let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        if !ranked.is_empty() {
+            for (sid, name) in ranked.into_iter().filter(|(sid, _)| *sid > 0 && !excluded.contains(sid)) {
+                if picks.len() >= take_n {
+                    break;
+                }
+                if seen.insert(sid) {
+                    picks.push((sid, name));
+                }
+            }
+        } else {
+            for (sid, name, _seg) in crate::market::liquid_stocks() {
+                if sid > 0 && !excluded.contains(&sid) && seen.insert(sid) {
+                    picks.push((sid, Some(name)));
+                }
+            }
+        }
+        // The operator's hand-added names are always included (beyond top-N), so
+        // a manual override can never be silently dropped by the cap.
+        for sid in &settings.liquid_list {
+            if *sid > 0 && !excluded.contains(sid) && seen.insert(*sid) {
+                picks.push((*sid, None));
+            }
+        }
+        let mut out: Vec<Strategy> = Vec::with_capacity(picks.len());
+        for (sid, known_name) in picks {
+            // Guard against a hand-added id that is not cash equity: when the
+            // scrip master knows the contract and it is not an EQUITY/EQ NSE row,
+            // this book must never trade it (no index, option or future).
+            if let Some(c) = scrip::get().and_then(|sc| sc.contract(sid).cloned()) {
+                let is_cash = c.exchange.eq_ignore_ascii_case("NSE")
+                    && (c.instrument.eq_ignore_ascii_case("EQUITY") || c.instrument.eq_ignore_ascii_case("EQ"));
+                if !is_cash {
+                    continue;
+                }
+            }
+            // Resolve the name from the scrip master first (the full universe),
+            // then the small catalog, so a scanned name is never blank.
+            let scrip_name = scrip::get().and_then(|sc| sc.contract(sid).map(|c| c.underlying.clone()));
+            let meta = crate::market::equity_meta(sid);
+            let name = known_name
+                .or(scrip_name)
+                .or_else(|| meta.as_ref().map(|(n, _, _)| n.clone()))
+                .unwrap_or_else(|| sid.to_string());
+            let seg = "NSE_EQ".to_string();
+            let inst = "EQUITY".to_string();
+            let id = format!("eqscan:{}:BUY", sid);
+            out.push(Strategy {
+                id,
+                name: format!("{name} [equity bullish]"),
+                category: "BULLISH".into(),
+                timeframe: String::new(),
+                security_id: sid,
+                exchange_segment: seg,
+                instrument: inst,
+                trading_symbol: name,
+                side: "BUY".into(),
+                enabled: true,
+                conditions: Vec::new(),
+                last_signal: 0,
+                last_error: String::new(),
+                synthetic: true,
+                lot: 1.0,
+                group: String::new(),
+                manual: false,
+                movers_leg: false,
+                liquid_leg: true,
+            });
+        }
+        out
+    }
+
+    /// Premium-chart-only strict trend pin.
+    ///
+    /// In premium-only mode, when a trend-following section is ON, every leg it
+    /// OWNS is pinned to the committed trend side: a bullish committed trend arms
+    /// ONLY the CE call leg and a bearish one ONLY the PE put leg. The opposite
+    /// leg is never built, so a premium-chart book can never hold a losing
+    /// opposite-side leg through a trend flip. A neutral / uncommitted read arms
+    /// nothing for that underlying - the side is never guessed.
+    ///
+    /// Coverage is deliberate so untouched setups keep their behaviour:
+    ///   * Indices Trend Following owns the operator's index set.
+    ///   * Commodities Trend Following owns the operator's commodity set.
+    ///   * NIFTY Trend Following owns the index / F&O stock legs.
+    ///
+    /// Returns `Some(Some(bull))` to pin the leg, `Some(None)` to drop the
+    /// underlying (no committed side), and `None` when no trend section covers it
+    /// (the caller leaves the leg untouched).
+    fn premium_trend_pin(&self, settings: &Settings, sid: i64) -> Option<Option<bool>> {
+        let pick_side = |payload: &Value| -> Option<bool> {
+            for r in payload.as_array().into_iter().flatten() {
+                if ji(r, "securityId") == sid {
+                    let side = js(r, "side");
+                    if side.eq_ignore_ascii_case("CE") {
+                        return Some(true);
+                    }
+                    if side.eq_ignore_ascii_case("PE") {
+                        return Some(false);
+                    }
+                }
+            }
+            None
+        };
+        if self.allows_indices() && settings.index_trend_on && settings.movers_indices.contains(&sid) {
+            let payload = self.index_trend_picks.lock().map(|g| g.1.clone()).unwrap_or(Value::Null);
+            return Some(pick_side(&payload));
+        }
+        if self.allows_commodities() && settings.comm_trend_on && settings.commodity_list.contains(&sid) {
+            let payload = self.comm_trend_picks.lock().map(|g| g.1.clone()).unwrap_or(Value::Null);
+            return Some(pick_side(&payload));
+        }
+        if settings.nifty_trend_on {
+            if let Some((_, seg, inst)) = crate::market::symbol_meta(sid) {
+                if matches!(category_for(&seg, &inst), StratCat::Fno | StratCat::Index) {
+                    let dir = self.nifty_dir.load(Ordering::Relaxed);
+                    return Some(if dir > 0 {
+                        Some(true)
+                    } else if dir < 0 {
+                        Some(false)
+                    } else {
+                        None
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    /// Apply [`premium_trend_pin`] to a fully-built scan universe: for every leg
+    /// running on the premium chart, keep only the committed trend side, drop
+    /// both legs of an underlying that has no committed side yet, and leave
+    /// spot-routed / uncovered underlyings untouched. No-op outside premium mode.
+    fn apply_premium_trend_pin(&self, settings: &Settings, out: Vec<Strategy>) -> Vec<Strategy> {
+        out.into_iter()
+            .filter(|s| {
+                // Only legs actually trading their option-premium chart are
+                // strictly pinned; a category left on the spot chart keeps the
+                // normal bull/bear gating.
+                if !premium_only_for(s, settings) {
+                    return true;
+                }
+                match self.premium_trend_pin(settings, s.security_id) {
+                    Some(Some(want_bull)) => strategy_is_bull(s) == want_bull,
+                    Some(None) => false,
+                    None => true,
+                }
+            })
+            .collect()
+    }
+
     fn scanner_targets(&self, settings: &Settings) -> Vec<Strategy> {
+        // Equity Indicator Based Trade (Paper Trade 4): a completely separate
+        // universe - liquid NSE cash EQUITY only, BUY side only, gated by the
+        // BULLISH indicator filters only. No indices, no options, no strikes, no
+        // commodities. Every name resolves to its NSE_EQ / EQ row and is a plain
+        // spot BUY; the option-leg machinery below is never reached.
+        if self.equity_indicators_only() || settings.equity_only {
+            return self.equity_scanner_targets(settings);
+        }
         let (bull_side, bear_side) = if premium_only_active(settings) {
             // "Premium chart only (run + trade)": only the BULLISH indicator
             // filters gate entries, and they gate BOTH legs - the Top Gainer CE
@@ -7778,7 +8615,7 @@ impl RealtimeState {
         if nifty_dir_feature_on(settings) && !indices_only {
             let sideways_block = settings.no_trade_sideways && self.nifty_sideways.load(Ordering::Relaxed);
             if sideways_block {
-                return out;
+                return self.apply_premium_trend_pin(settings, out);
             }
             let payload = self.nifty_picks.lock().map(|g| g.1.clone()).unwrap_or(Value::Null);
             for p in jarr(&payload, "picks") {
@@ -7802,7 +8639,7 @@ impl RealtimeState {
             }
         }
 
-        out
+        self.apply_premium_trend_pin(settings, out)
     }
 
     // -----------------------------------------------------------------------
@@ -7900,18 +8737,13 @@ impl RealtimeState {
             .filter(|s| in_run(s) && s.security_id > 0 && (!s.conditions.is_empty() || s.synthetic))
             .count();
         if eligible == 0 && !movers_on && !commodity_on {
-            self.note_blocker(
-                "warn",
-                "no-instruments",
-                "",
-                "No tradeable instruments resolved - open a chart symbol, enable Top Movers or Commodities, and tick at least one indicator filter",
-            );
-            self.log_throttled(
-                "no-instruments",
-                15_000,
-                "warn",
-                "No tradeable instruments resolved - open a chart symbol, enable Top Movers or Commodities, and tick at least one indicator filter",
-            );
+            let why = if settings0.equity_only {
+                "No tradeable equity instruments - turn the Liquid Equity master ON and tick at least one BULLISH indicator filter"
+            } else {
+                "No tradeable instruments resolved - open a chart symbol, enable Top Movers or Commodities, and tick at least one indicator filter"
+            };
+            self.note_blocker("warn", "no-instruments", "", why);
+            self.log_throttled("no-instruments", 15_000, "warn", why);
         }
         self.log_throttled(
             "scan-diag",
@@ -7948,8 +8780,8 @@ impl RealtimeState {
             // F&O-stock expiry-day no-trade block: on a stock expiry day, no new
             // stock entry may fire - either all day ("No trade on expiry day") or
             // from the cutoff onwards. Only the F&O class is gated; indices /
-            // commodities keep running.
-            if fno_expiry_no_trade && strat_category(&strat) == StratCat::Fno {
+            // commodities / cash equity keep running.
+            if fno_expiry_no_trade && !settings0.equity_only && strat_category(&strat) == StratCat::Fno {
                 self.note_blocker(
                     "info",
                     "fno-expiry",
@@ -9022,6 +9854,9 @@ impl RealtimeState {
                 point_trail,
                 mut peak_profit,
                 points_from_pct,
+                trail_switch_on,
+                ai_trail_on,
+                point_trail_on,
                 mut net_peak,
                 qty,
                 instrument,
@@ -9059,6 +9894,9 @@ impl RealtimeState {
                     jf(p, "pointTrail"),
                     jf(p, "peakProfit"),
                     d.settings.trail_points_from_pct,
+                    d.settings.manual_trail_sl,
+                    d.settings.ai_trail_tp,
+                    d.settings.manual_point_trail_sl,
                     jf(p, "netPeak"),
                     jf(p, "filledQty").max(jf(p, "qty")),
                     js(p, "instrument"),
@@ -9341,11 +10179,21 @@ impl RealtimeState {
             // exact point equivalent of the percentage stop (they are equal at
             // every price, not just at entry). Unlinked, the operator's fixed
             // points value is used and the tighter stop wins.
-            let points_live = if points_from_pct {
-                if trail > 0.0 { peak_profit.max(0.0) * trail / 100.0 } else { 0.0 }
-            } else {
-                point_trail
-            };
+            //
+            // Live switches are AUTHORITATIVE. The stored per-position `trail`
+            // and `pointTrail` are only the entry-time values; they must never
+            // keep ratcheting a stop after the operator unticks the switch.
+            // Checking the box OFF disables the app-side trail for EVERY open
+            // position immediately, not just for trades opened afterwards.
+            let (trail_pct_live, points_live) = live_trail_inputs(
+                trail_switch_on,
+                ai_trail_on,
+                point_trail_on,
+                points_from_pct,
+                trail,
+                point_trail,
+                peak_profit,
+            );
             // Native-trail positions are ratcheted by the broker's own OMS, so
             // the engine never computes a second app-side stop for them (one
             // position, one trail). `broker_trail_owned` freezes that decision at
@@ -9354,7 +10202,7 @@ impl RealtimeState {
             let (sl, trail_source) = if broker_trail_owned {
                 (overall_sl, "")
             } else {
-                active_trail_stop(is_buy, entry, peak_profit, trail, points_live, overall_sl)
+                active_trail_stop(is_buy, entry, peak_profit, trail_pct_live, points_live, overall_sl)
             };
             let sl_trailed = !trail_source.is_empty();
             if let Some(mut d) = self.doc() {
@@ -9403,27 +10251,14 @@ impl RealtimeState {
                     if !level_hit {
                         false
                     } else {
-                        // Never book a Target Lab exit that does not cover the
-                        // round-trip charges + exit slippage. A target can be
-                        // technically hit while a far-OTM/near-expiry option's
-                        // premium stays flat; cutting there only realises a loss.
-                        let exit_px = if self.paper && (slip_bps > 0.0 || spread.on) {
-                            spread.fill(ltp, false, slip_bps)
-                        } else {
-                            ltp
-                        };
-                        let gross = (exit_px - entry) * qty;
-                        compute_charges_for_trade(
-                            entry,
-                            exit_px,
-                            qty,
-                            &side,
-                            &instrument,
-                            &trading_symbol,
-                            gross,
-                        )
-                        .map(|c| c.net > 0.0)
-                        .unwrap_or(gross > 0.0)
+                        // The underlying reached the target. ALWAYS close here: a
+                        // target that is hit and then left open only reverses into
+                        // the hard stop and turns a green trade red. If the option
+                        // premium did not advance enough to cover charges the exit
+                        // is booked at a small loss, never a naked reversal - the
+                        // whole point of the Target Lab plan is that its target is
+                        // the exit.
+                        true
                     }
                 }
             };
@@ -10190,7 +11025,14 @@ impl RealtimeState {
         let mut out = strat.clone();
         out.security_id = res.security_id;
         out.exchange_segment = seg.to_string();
-        out.instrument = if scrip::is_index_prefix(&prefix) { "OPTIDX" } else { "OPTSTK" }.to_string();
+        out.instrument = if scrip::is_index_prefix(&prefix) {
+            "OPTIDX"
+        } else if exch.eq_ignore_ascii_case("MCX") || exch.eq_ignore_ascii_case("NCDEX") {
+            "OPTFUT"
+        } else {
+            "OPTSTK"
+        }
+        .to_string();
         out.trading_symbol = res.trading_symbol;
         Some(out)
     }
@@ -17360,6 +18202,11 @@ fn premium_only_active(s: &Settings) -> bool {
 /// is on the spot chart, the normal behaviour applies (bullish filters gate CE,
 /// bearish filters gate PE).
 fn premium_only_for_cat(cat: StratCat, s: &Settings) -> bool {
+    // The equity-only book has no option premium chart at all - everything runs
+    // and trades on the cash spot chart.
+    if s.equity_only {
+        return false;
+    }
     if s.premium_only {
         return true;
     }
@@ -17488,6 +18335,10 @@ fn price_vs_ema_vote(c: &[Candle]) -> i64 {
 
 /// Chart the strategy conditions are evaluated on: `spot` | `premium` | `both`.
 fn run_mode_of(strat: &Strategy, s: &Settings) -> String {
+    // The equity-only book always evaluates on the cash spot chart.
+    if s.equity_only {
+        return "spot".into();
+    }
     // "Premium chart only (run + trade)": the strategy / indicator-filter mode
     // runs on the option-premium chart (Top Gainer on the CE leg, Top Loser on the
     // PE leg), never on spot. Decided per category so Paper Trade 2 can run only
@@ -17507,6 +18358,11 @@ fn run_mode_of(strat: &Strategy, s: &Settings) -> String {
 /// always execute on the premium chart"). The resolved premium leg is chosen by
 /// the run/eval path; `trade_mode_of` only labels that intent for the UI.
 fn trade_mode_of(_strat: &Strategy, _s: &Settings) -> String {
+    // The equity-only book always executes on the cash spot chart - there is no
+    // option premium contract to trade.
+    if _s.equity_only {
+        return "spot".into();
+    }
     "premium".into()
 }
 
@@ -17613,6 +18469,10 @@ fn run_mode_for(seg: &str, inst: &str, s: &Settings) -> String {
         instrument: inst.to_string(),
         ..Default::default()
     };
+    // The equity-only book always evaluates on the cash spot chart.
+    if s.equity_only {
+        return "spot".into();
+    }
     // "Premium chart only (run + trade)": run on the option-premium chart.
     if premium_only_for(&strat, s) {
         return "premium".into();
@@ -18006,6 +18866,44 @@ fn point_trail_stop(is_buy: bool, entry: f64, peak_profit: f64, points: f64) -> 
     } else {
         entry - peak_profit + jump
     }
+}
+
+/// Resolve the app-side trail inputs for one position from the LIVE operator
+/// switches plus the entry-time stored values.
+///
+/// The stored `trail` / `pointTrail` are frozen at entry, so the manager must
+/// re-gate them on the live switches every tick: unticking a switch has to stop
+/// the trail immediately for every open position (the "unchecked but trail still
+/// fires" bug). Returns `(trail_pct_live, points_live)`; both zero means no
+/// app-side trail is active.
+///
+/// `points_from_pct` ("Pts = % (auto)") derives the point jump from the live
+/// percentage, so it is active only while the percentage trail itself is active -
+/// the auto-ticked point box must never keep a trail alive after the % switch is
+/// unticked. An unlinked manual point trail is gated by its own switch.
+fn live_trail_inputs(
+    trail_switch_on: bool,
+    ai_trail_on: bool,
+    point_trail_on: bool,
+    points_from_pct: bool,
+    stored_trail_pct: f64,
+    stored_point_trail: f64,
+    peak_profit: f64,
+) -> (f64, f64) {
+    let pct_active = trail_switch_on || ai_trail_on;
+    let trail_pct_live = if pct_active { stored_trail_pct } else { 0.0 };
+    let points_live = if points_from_pct {
+        if pct_active && trail_pct_live > 0.0 {
+            peak_profit.max(0.0) * trail_pct_live / 100.0
+        } else {
+            0.0
+        }
+    } else if point_trail_on {
+        stored_point_trail
+    } else {
+        0.0
+    };
+    (trail_pct_live, points_live)
 }
 
 /// Pick the active app-side trail stop. Both the percentage and the points
@@ -19249,6 +20147,15 @@ pub async fn settings_post(State(rt): State<RealtimeState>, Json(v): Json<Value>
         d.settings.liquid_auto_lot_oi_pct = d.settings.liquid_auto_lot_oi_pct.clamp(0.0, 100.0);
         d.settings.liquid_slice_lot_limit = d.settings.liquid_slice_lot_limit.max(0.0).round();
         d.settings.liquid_slice_lots = d.settings.liquid_slice_lots.max(0.0).round();
+        // Daily equity-liquidity scan hygiene: the trade count stays a whole
+        // number in 1..=50, the scan time must parse as IST HH:MM, and the
+        // turnover floor is a non-negative ₹-crore amount. A hand-edited file or
+        // raw POST can never store a nonsense value that breaks the scan.
+        d.settings.liquid_trade_count = d.settings.liquid_trade_count.clamp(1, 500);
+        if hhmm_to_minutes(&d.settings.liquid_scan_time).is_none() {
+            d.settings.liquid_scan_time = "09:20".into();
+        }
+        d.settings.liquid_scan_min_turnover_cr = d.settings.liquid_scan_min_turnover_cr.max(0.0);
         // The same hygiene applies to the global Auto-Lot / slicing config the
         // other legs use, so both policies are validated identically.
         d.settings.auto_lot_volume_pct = d.settings.auto_lot_volume_pct.clamp(0.0, 100.0);
@@ -20136,12 +21043,72 @@ pub async fn movers_get(State(rt): State<RealtimeState>) -> impl IntoResponse {
 /// losers from the liquid index-constituent basket plus the operator's manual
 /// adds. Also on-demand so the dropdowns and the chip row fill immediately.
 pub async fn liquid_get(State(rt): State<RealtimeState>) -> impl IntoResponse {
+    // Equity Indicator Based Trade: the readout is the daily full-universe
+    // liquidity scan (ranked cash-equity stocks), never the F&O option leg
+    // resolver. Serve that cache directly.
+    let equity = rt.equity_indicators_only()
+        || rt.doc().map(|d| d.settings.equity_only).unwrap_or(false);
+    if equity {
+        rt.refresh_equity_liquidity(false).await;
+        let (at, payload) = rt
+            .equity_liquidity_cache
+            .lock()
+            .map(|g| (g.0, g.1.clone()))
+            .unwrap_or((0, Value::Null));
+        if payload.is_object() {
+            return Json(payload);
+        }
+        return Json(json!({
+            "ok": true,
+            "on": false,
+            "at": at,
+            "stocks": [],
+        }));
+    }
     rt.refresh_liquid().await;
     let (at, payload) = rt.liquid_cache.lock().map(|g| (g.0, g.1.clone())).unwrap_or((0, Value::Null));
     if payload.is_object() {
         Json(payload)
     } else {
         Json(json!({ "ok": true, "on": false, "at": at, "gainers": [], "losers": [], "added": [], "bias": 0 }))
+    }
+}
+
+/// Force an immediate daily liquidity scan (`POST /liquid` with `{"action":
+/// "scan"}`) for the Equity Indicator Based Trade book. Returns the refreshed
+/// ranked payload so the "Scan now" button updates without a second poll.
+pub async fn liquid_scan_post(State(rt): State<RealtimeState>, Json(v): Json<Value>) -> impl IntoResponse {
+    let action = v.get("action").and_then(|x| x.as_str()).unwrap_or("");
+    let equity = rt.equity_indicators_only()
+        || rt.doc().map(|d| d.settings.equity_only).unwrap_or(false);
+    if !equity {
+        return Json(json!({ "ok": false, "error": "not an equity engine" }));
+    }
+    if action == "scan" {
+        // Kick the heavy full-universe scan onto a detached task: a full sweep
+        // can take a minute or two (Dhan data-gate + 100-id chunks), far longer
+        // than an HTTP request should block (proxy timeouts) and long enough
+        // that a second click must not cancel it. The force flag makes the next
+        // pass run even after today already scanned; the frontend polls
+        // `/liquid` and watches the `at` stamp change, keeping "Scanning..."
+        // visible until the fresh rows actually land - so the button never
+        // appears to do nothing.
+        rt.equity_liquidity_force.store(true, Ordering::Release);
+        rt.last_equity_liquidity.store(0, Ordering::Relaxed);
+        let bg = rt.clone();
+        tokio::spawn(async move {
+            bg.refresh_equity_liquidity(true).await;
+        });
+    }
+    let (at, payload) = rt
+        .equity_liquidity_cache
+        .lock()
+        .map(|g| (g.0, g.1.clone()))
+        .unwrap_or((0, Value::Null));
+    if payload.is_object() {
+        Json(payload)
+    } else {
+        Json(json!({ "ok": true, "on": false, "at": at, "stocks": [] }))
     }
 }
 
@@ -20763,7 +21730,7 @@ macro_rules! rt_routes {
             .route(concat!($p, "/account"), get(account_get))
             .route(concat!($p, "/pool"), get(pool_get))
             .route(concat!($p, "/movers"), get(movers_get))
-            .route(concat!($p, "/liquid"), get(liquid_get))
+            .route(concat!($p, "/liquid"), get(liquid_get).post(liquid_scan_post))
             .route(concat!($p, "/trend"), get(trend_get))
             .route(concat!($p, "/nifty-pane"), get(nifty_pane_get))
             .route(concat!($p, "/commodities"), get(commodities_get))
@@ -20819,6 +21786,13 @@ pub fn paper2_router() -> Router<RealtimeState> {
 /// engine with a separate durable state file - shares no data with the others.
 pub fn paper3_router() -> Router<RealtimeState> {
     rt_routes!("/api/paper3")
+}
+
+/// Fourth independent paper-trading API (`/api/paper4/*`), routed to its own
+/// equity-only engine with a separate durable state file - shares no data with
+/// the others. Trades liquid NSE cash EQUITY only (bullish indicators).
+pub fn paper4_router() -> Router<RealtimeState> {
+    rt_routes!("/api/paper4")
 }
 
 /// Auto Experiment API (`/api/autoexp/*`), routed to a complete, fully
@@ -21003,6 +21977,116 @@ mod gate_tests {
         assert!(s.spot_candle_gate);
         assert!(s.slice_on, "PT3 exposes the same slicing controls as PT2");
         assert!(s.trail_points_from_pct);
+    }
+
+    /// The daily equity-liquidity score ranks by turnover, boosted (capped) by
+    /// growth versus the previous session, and drops names under the floor.
+    #[test]
+    fn equity_liquidity_ranks_turnover_with_capped_growth_boost() {
+        let rows = vec![
+            // (sid, turnover ₹, last, change %)
+            (1, 1000.0 * 1e7, 100.0, 1.0),  // 1000 cr, no baseline
+            (2, 500.0 * 1e7, 50.0, 2.0),    // 500 cr, no baseline
+            (3, 10.0 * 1e7, 10.0, 0.0),     // 10 cr, below a 50 cr floor
+        ];
+        let mut prev = serde_json::Map::new();
+        // Stock 2 grew 50% -> boost 1.5 => 750 effective.
+        prev.insert("2".into(), json!(500.0 * 1e7 / 1.5));
+        // Stock 1 shrank to a third (growth -66%) -> no demotion, boost = 1.
+        prev.insert("1".into(), json!(3000.0 * 1e7));
+        let ranked = rank_liquidity(rows.clone(), Some(&prev), 50.0);
+        let order: Vec<i64> = ranked.iter().map(|r| r.sid).collect();
+        assert_eq!(order, vec![1, 2], "turnover leads, growth boosts but never demotes, floor drops #3");
+        assert_eq!(ranked[0].growth, Some(1.0 / 3.0 - 1.0), "stock 1 shows its real (negative) growth");
+        assert!((ranked[1].score - 750.0).abs() < 1e-6, "stock 2 score = 500cr x 1.5 boost");
+
+        // A wild growth print is capped at +300% (boost 4x), not unlimited.
+        let mut hot = serde_json::Map::new();
+        hot.insert("2".into(), json!(1.0));
+        let ranked2 = rank_liquidity(vec![(2, 500.0 * 1e7, 50.0, 0.0)], Some(&hot), 0.0);
+        assert!((ranked2[0].score - 500.0 * 4.0).abs() < 1e-6, "growth boost is capped at 4x");
+    }
+
+    #[tokio::test]
+    async fn paper4_is_an_equity_only_engine() {
+        let rt4 = RealtimeState::new_paper4(crate::broker::DhanState::new(crate::market::MarketState::new()));
+        assert!(rt4.paper, "PT4 must use simulated execution");
+        assert_eq!(rt4.state_file, STATE_FILE_PAPER4);
+        assert_ne!(rt4.state_file, STATE_FILE_PAPER3);
+        assert!(rt4.equity_indicators_only());
+        assert!(!rt4.allows_indices(), "PT4 never runs an index");
+        assert!(!rt4.allows_commodities(), "PT4 never runs a commodity");
+        assert!(rt4.allows_liquid_stocks(), "PT4 trades liquid cash equity");
+
+        // The sanitizer pins the equity-only shape: no indices / commodities /
+        // Top Movers / NIFTY trend / BB%b, no option controls, spot routing,
+        // bullish-only filters, and the liquid universe available.
+        let mut s = Settings::default();
+        s.movers_on = true;
+        s.movers_indices = vec![13];
+        s.commodity_on = true;
+        s.commodity_list = vec![428348];
+        s.index_trend_on = true;
+        s.comm_trend_on = true;
+        s.nifty_trend_on = true;
+        s.bbpct_pane_on = true;
+        s.manual_strikes_enabled = true;
+        s.only_positive = true;
+        s.fastest_rising = true;
+        s.premium_only = true;
+        s.option_side = "both".into();
+        s.filters.insert("BullSlEma5".into(), true);
+        s.filters.insert("BearSlEma5".into(), true);
+        s.entry_primary_filters = vec!["BullSlEma5".into(), "BearSlEma5".into()];
+        s.liquid_list = vec![2885];
+        rt4.enforce_constraints(&mut s);
+
+        assert!(s.equity_only, "PT4 pins the equity-only flag");
+        assert!(!s.movers_on, "PT4 has no Top Movers index master");
+        assert!(s.movers_indices.is_empty());
+        assert!(!s.commodity_on, "PT4 has no commodity book");
+        assert!(s.commodity_list.is_empty());
+        assert!(!s.index_trend_on, "PT4 has no Indices Trend Following");
+        assert!(!s.comm_trend_on, "PT4 has no Commodities Trend Following");
+        assert!(!s.nifty_trend_on, "PT4 has no NIFTY trend-follow");
+        assert!(!s.bbpct_pane_on, "PT4 has no BB%b pane");
+        assert!(!s.manual_strikes_enabled, "PT4 has no manual strike select");
+        assert!(!s.only_positive, "PT4 has no +green premium filter");
+        assert!(!s.fastest_rising, "PT4 has no fastest-rising filter");
+        assert!(!s.premium_only, "PT4 has no premium chart");
+        assert_eq!(s.option_side, "CE", "PT4 never trades a put");
+        assert_eq!(s.run_fno, "spot");
+        assert_eq!(s.trade_in_fno, "spot");
+        assert!(s.filters.get("BullSlEma5").copied().unwrap_or(false), "PT4 keeps bullish filters");
+        assert!(!s.filters.get("BearSlEma5").copied().unwrap_or(false), "PT4 drops bearish filters");
+        assert_eq!(s.entry_primary_filters, vec!["BullSlEma5".to_string()], "PT4 keeps only bullish primary");
+        assert_eq!(s.liquid_list, vec![2885], "PT4 keeps the liquid universe additions");
+        assert!(s.filter_mode, "PT4 runs the indicator-filter gate");
+        // Daily liquidity scan knobs are clamped into a sane band.
+        s.liquid_trade_count = 999;
+        s.liquid_scan_time = "nonsense".into();
+        s.liquid_scan_min_turnover_cr = -5.0;
+        rt4.enforce_constraints(&mut s);
+        assert_eq!(s.liquid_trade_count, 500, "PT4 clamps the trade count to 1..=500");
+        assert_eq!(s.liquid_scan_time, "09:20", "PT4 resets an unparseable scan time");
+        assert_eq!(s.liquid_scan_min_turnover_cr, 0.0, "PT4 floor is never negative");
+
+        // The scanner builds plain spot BUY strategies from the liquid basket,
+        // gated by a bullish filter, and only while the liquid master is armed.
+        s.liquid_on = false;
+        assert!(rt4.scanner_targets(&s).is_empty(), "equity scanner is off until the liquid master is armed");
+        s.liquid_on = true;
+        let out = rt4.scanner_targets(&s);
+        assert!(!out.is_empty(), "a bullish filter + liquid master must build equity targets");
+        assert!(out.iter().all(|t| t.side.eq_ignore_ascii_case("BUY")), "equity targets are BUY only");
+        assert!(
+            out.iter().all(|t| !t.instrument.eq_ignore_ascii_case("OPTSTK")
+                && !t.instrument.eq_ignore_ascii_case("OPTIDX")),
+            "equity targets never resolve an option contract"
+        );
+        // No bullish filter armed = no targets.
+        s.filters.clear();
+        assert!(rt4.scanner_targets(&s).is_empty(), "no bullish filter means no equity entry rule");
     }
 
     #[tokio::test]
@@ -22227,6 +23311,87 @@ mod gate_tests {
         }
         let out = rt.scanner_targets(&s);
         assert!(has(&out, &ce) && !has(&out, &pe), "bullish NIFTY + gainers-only runs CE only");
+    }
+
+    #[tokio::test]
+    async fn premium_only_pins_the_index_trend_leg_to_its_committed_side() {
+        // Premium-chart-only + Indices Trend Following: the committed trend side
+        // strictly owns the leg - bullish arms ONLY the CE, bearish ONLY the PE,
+        // and a neutral / uncommitted read arms nothing. The opposite side is
+        // never built, so a reversal cannot leave a losing opposite leg open.
+        let rt = RealtimeState::new_paper2(crate::broker::DhanState::new(crate::market::MarketState::new()));
+        let sid = 13; // NIFTY 50 (IDX_I INDEX)
+        let ce = format!("scan:{}:CE", sid);
+        let pe = format!("scan:{}:PE", sid);
+        let has = |out: &[Strategy], key: &str| out.iter().any(|t| t.id == key);
+        let mut s = Settings::default();
+        s.premium_only = true;
+        s.index_trend_on = true;
+        s.movers_indices = vec![sid];
+        s.filters.insert("BullIncUp".into(), true);
+
+        if let Ok(mut g) = rt.index_trend_picks.lock() {
+            *g = (now_ms(), json!([{ "securityId": sid, "side": "CE" }]));
+        }
+        let out = rt.scanner_targets(&s);
+        assert!(has(&out, &ce), "bullish trend must arm the CE leg");
+        assert!(!has(&out, &pe), "bullish trend must never arm the PE leg");
+
+        if let Ok(mut g) = rt.index_trend_picks.lock() {
+            *g = (now_ms(), json!([{ "securityId": sid, "side": "PE" }]));
+        }
+        let out = rt.scanner_targets(&s);
+        assert!(has(&out, &pe), "bearish trend must arm the PE leg");
+        assert!(!has(&out, &ce), "bearish trend must never arm the CE leg");
+
+        if let Ok(mut g) = rt.index_trend_picks.lock() {
+            *g = (now_ms(), json!([]));
+        }
+        assert!(rt.scanner_targets(&s).is_empty(), "neutral trend arms nothing (never guesses a side)");
+
+        // Outside premium mode the same neutral read is not pinned and both legs
+        // build for a plain (non-trend-owned) index universe - regression guard.
+        s.premium_only = false;
+        s.index_trend_on = false;
+        s.movers_on = true;
+        if let Ok(mut g) = rt.movers_cache.lock() {
+            *g = (now_ms(), json!({ "gainers": [], "losers": [] }));
+        }
+        let out = rt.scanner_targets(&s);
+        assert!(has(&out, &ce) && has(&out, &pe), "without premium mode the plain index builds both legs");
+    }
+
+    #[tokio::test]
+    async fn premium_only_pins_the_commodity_trend_leg_to_its_committed_side() {
+        let _c = crate::market::CommodityFixtureGuard::install();
+        let rt = RealtimeState::new_paper3(crate::broker::DhanState::new(crate::market::MarketState::new()));
+        let sid = 500004; // NATURALGAS (test MCX fixture row)
+        let ce = format!("scan:{}:CE", sid);
+        let pe = format!("scan:{}:PE", sid);
+        let has = |out: &[Strategy], key: &str| out.iter().any(|t| t.id == key);
+        let mut s = Settings::default();
+        s.premium_only = true;
+        s.commodity_on = true;
+        s.commodity_list = vec![sid];
+        s.comm_trend_on = true;
+        s.filters.insert("BullIncUp".into(), true);
+
+        if let Ok(mut g) = rt.comm_trend_picks.lock() {
+            *g = (now_ms(), json!([{ "securityId": sid, "side": "CE" }]));
+        }
+        let out = rt.scanner_targets(&s);
+        assert!(has(&out, &ce) && !has(&out, &pe), "bullish commodity trend arms CE only");
+
+        if let Ok(mut g) = rt.comm_trend_picks.lock() {
+            *g = (now_ms(), json!([{ "securityId": sid, "side": "PE" }]));
+        }
+        let out = rt.scanner_targets(&s);
+        assert!(has(&out, &pe) && !has(&out, &ce), "bearish commodity trend arms PE only");
+
+        if let Ok(mut g) = rt.comm_trend_picks.lock() {
+            *g = (now_ms(), json!([]));
+        }
+        assert!(rt.scanner_targets(&s).is_empty(), "neutral commodity trend arms nothing");
     }
 
     #[tokio::test]
@@ -24949,6 +26114,44 @@ mod gate_tests {
         let (sl, src) = active_trail_stop(true, 100.0, 5.0, 10.0, 10.0, 130.0);
         assert!((sl - 130.0).abs() < 1e-9, "sl={sl}");
         assert_eq!(src, "");
+    }
+
+    #[test]
+    fn unticked_trail_switch_disables_trail_for_open_positions() {
+        // The stored values are the entry-time snapshot (e.g. 20% trail and a
+        // smuggled point jump). With every switch OFF the manager must resolve
+        // NO active trail at all, so a stale stored trail can never keep firing.
+        let (pct, pts) = live_trail_inputs(false, false, false, false, 20.0, 5.0, 30.0);
+        assert_eq!(pct, 0.0);
+        assert_eq!(pts, 0.0);
+        let (sl, src) = active_trail_stop(true, 100.0, 30.0, pct, pts, 0.0);
+        assert_eq!(sl, 0.0, "no trail stop when every switch is off");
+        assert_eq!(src, "");
+        // Percent switch ON restores the stored percentage.
+        let (pct, pts) = live_trail_inputs(true, false, false, false, 20.0, 5.0, 30.0);
+        assert_eq!(pct, 20.0);
+        assert_eq!(pts, 0.0, "unlinked point gear stays off without its own tick");
+        // AI-trail switch alone also arms the stored percentage.
+        let (pct, _) = live_trail_inputs(false, true, false, false, 20.0, 0.0, 30.0);
+        assert_eq!(pct, 20.0);
+        // A standalone manual point trail needs its own tick.
+        let (pct, pts) = live_trail_inputs(false, false, true, false, 20.0, 5.0, 30.0);
+        assert_eq!(pct, 0.0);
+        assert_eq!(pts, 5.0);
+    }
+
+    #[test]
+    fn linked_point_gear_is_strictly_off_when_the_percent_switch_is_off() {
+        // "Pts = % (auto)" auto-ticks the point box in the UI. Unticking the %
+        // switch must still kill the DERIVED point trail: the link is only a
+        // projection of the percentage, never an independent source.
+        let (pct, pts) = live_trail_inputs(false, false, true, true, 20.0, 0.0, 30.0);
+        assert_eq!(pct, 0.0);
+        assert_eq!(pts, 0.0, "linked point gear must die with the percent switch");
+        // With the % switch on, the derived point distance tracks live profit.
+        let (pct, pts) = live_trail_inputs(true, false, true, true, 20.0, 0.0, 30.0);
+        assert_eq!(pct, 20.0);
+        assert!((pts - 6.0).abs() < 1e-9, "pts={pts}");
     }
 
     #[test]

@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Equity Indicator Based Trade Stats - Dhan Algo</title>
+<link rel="stylesheet" href="./app.css?v=18">
+<style>
+  body { display: flex; flex-direction: column; height: 100%; }
+  .paper-banner {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    padding: 6px 10px; background: #1a1030; border-bottom: 1px solid #4a2d7e;
+    font-size: 11px; color: #c4a9ff;
+  }
+  .paper-banner b { color: #e6d9ff; letter-spacing: .3px; }
+  .paper-banner span { color: #9a86c8; }
+  .tab-content { flex: 1 1 auto; height: auto; min-height: 0; display: block; }
+  #tab-rtstats { overflow-y: auto; }
+</style>
+</head>
+<body data-tab="paperstats3">
+<div class="paper-banner">
+  <b>Equity Indicator Based Trade &middot; Trade Stats</b>
+  <span>Executed-trades report for the Equity Indicator Based Trade engine: every entry/exit here is a simulated cash-equity fill booked locally - no real orders are ever sent.</span>
+</div>
+<div class="tab-content" id="tab-rtstats"></div>
+
+<script src="./vendor/chart.umd.min.js"></script>
+<script>
+  // Equity Indicator Based Trade stats host: route every /api/rt call made by the shared stats
+  // UI to the independent PT3 engine and tag the report/CSV with its own name.
+  window.__PAPER__ = true;
+  window.__STATS_BASE__ = "/api/paper4";
+  window.__STATS_ENGINE__ = "paper4";
+  (function () {
+    const orig = window.fetch.bind(window);
+    window.fetch = function (u, o) {
+      if (typeof u === "string" && u.indexOf("/api/rt") === 0) {
+        u = "/api/paper4" + u.slice("/api/rt".length);
+      }
+      return orig(u, o);
+    };
+  })();
+  // Poll only while this pane is actually visible in the parent tab switcher.
+  (function () {
+    const root = document.getElementById("tab-rtstats");
+    const visible = function () {
+      const fe = window.frameElement;
+      if (!fe) return true;
+      return !!(fe.offsetParent && fe.clientHeight > 0);
+    };
+    const sync = function () { root.classList.toggle("active", visible()); };
+    setInterval(sync, 500);
+    sync();
+  })();
+</script>
+<script type="module">
+  import { bootRtStats } from "./rtstats.js?v=12";
+  import { bootTheme } from "./theme.js?v=4";
+  import { bootTextSize } from "./textsize.js?v=3";
+  bootRtStats();
+  bootTheme();
+  bootTextSize();
+  const head = document.querySelector("#tab-rtstats .rs-toolbar h3");
+  if (head) head.textContent = "Equity Indicator Based Trade - Executed Trades Report";
+  const desc = document.querySelector("#tab-rtstats .rs-toolbar span");
+  if (desc) desc.textContent = "Aggregates every executed trade from Equity Indicator Based Trade (simulated cash-equity fills, no real orders). Net basis when charges are banked.";
+</script>
+</body>
+</html>

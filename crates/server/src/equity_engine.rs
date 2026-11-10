@@ -24,7 +24,17 @@ pub struct Settings {
     pub capital: f64,
     pub per_trade_pct: f64,
     pub max_positions: usize,
+    /// Hard cap on how much of `capital` any SINGLE name can occupy, as a
+    /// percent. Auto-distribute over a small book could otherwise put 50%+ of
+    /// the capital into one microcap, so one gap-down stop wipes the account.
+    pub max_position_pct: f64,
+    /// Minimum MEASURED win-rate (%) a call must show before it is bought. Since
+    /// confidence now reports the replayed win-rate (typically 40-60%), this gate
+    /// lives on that same honest scale instead of the old "data coverage" score.
     pub min_confidence: f64,
+    /// One-time migration marker: when false the stored `min_confidence` is on
+    /// the old 0-100 data-coverage scale and is rebased onto the win-rate scale.
+    pub confidence_rebased: bool,
     pub min_upside_pct: f64,
     pub max_holding_days: i64,
     pub auto_exit: bool,
@@ -81,7 +91,13 @@ impl Default for Settings {
             capital: 500_000.0,
             per_trade_pct: 10.0,
             max_positions: 8,
-            min_confidence: 70.0,
+            max_position_pct: 15.0,
+            min_confidence: 52.0,
+            // Must default to false so an OLD state file (which lacks this field)
+            // deserializes as "not yet rebased" and the one-time 70->52 migration
+            // in `load()` actually runs. Defaulting to true silently kept the old
+            // 70 gate on the new win-rate scale and blocked every honest call.
+            confidence_rebased: false,
             min_upside_pct: 12.0,
             max_holding_days: 180,
             auto_exit: true,
@@ -273,6 +289,24 @@ fn load(mode: &str) -> EngineState {
     if st.created_at == 0 {
         st.created_at = now_secs();
     }
+    // One-time rebase: confidence used to be a 0-100 "data coverage" number and
+    // the gate sat at ~70. It is now the MEASURED replay win-rate (~40-60%), so a
+    // 70 gate would block every honest call. Remap once and never again.
+    //
+    // We ALSO heal the broken legacy state where `confidence_rebased` was already
+    // persisted as true while `min_confidence` still held the exact legacy 70
+    // default (an earlier build defaulted the flag to true, so the migration was
+    // skipped). Only the exact 70 default is healed so a deliberate high gate on
+    // the new scale is never clobbered on restart.
+    if !st.settings.confidence_rebased
+        || (st.settings.min_confidence - 70.0).abs() < 0.5
+    {
+        st.settings.min_confidence = 52.0;
+        st.settings.confidence_rebased = true;
+        st.log.push(note(
+            "Confidence ab measured win-rate par shift ho gayi - buy gate 52% par rebase kiya.",
+        ));
+    }
     if mode == "live" {
         if st.enabled {
             st.log.push(note("Server restarted - LIVE equity engine left disconnected. Re-arm it from Equity Research."));
@@ -369,6 +403,20 @@ fn equity_trail_stop(entry: f64, peak: f64, pct: f64) -> f64 {
     }
     let giveback = peak * pct / 100.0;
     entry + peak - giveback
+}
+
+/// Price at which a round trip on `qty` exactly breaks even after delivery
+/// charges. A trail stop is never allowed below this, so a trailing exit can
+/// never book a NET loss - which is exactly what used to churn the book to death
+/// (521 same-day "trail" exits, median +Rs 3, all eaten by charges).
+fn equity_breakeven_price(entry: f64, qty: i64) -> f64 {
+    if entry <= 0.0 || qty <= 0 {
+        return entry;
+    }
+    // Charges are ~ the same on both legs, so approximate the per-share drag with
+    // the round-trip cost at the entry price.
+    let charges = equity_charges(entry, entry, qty);
+    entry + charges / qty as f64
 }
 
 /// Net Take-Profit give-back floor: `None` until the peak NET profit has
@@ -566,24 +614,24 @@ fn view(mode: &str) -> Value {
     });
     let effective_capital = engine_capital(mode, st.settings.capital);
     let shared_cap = crate::shared_margin::cap_for(if mode == "live" { "equitylive" } else { "equitypaper" });
-    // Per-trade charges are computed on read (never stored) so the UI can show
-    // exactly what a trade paid without migrating the durable state. A closed
-    // trade uses its real entry/exit pair; an open one estimates the round trip
-    // at the live mark, which is the same number Net TP already watches.
+    // Per-trade charges are recomputed on read so the UI can show exactly what a
+    // trade paid. Closed trades already store a NET pnl (charges deducted at
+    // close), so netPnl there is just pnl; open trades mark the round trip at the
+    // live price, which is the same number Net TP watches.
     let trades: Vec<Value> = trades
         .iter()
         .map(|t| {
             let exit = if t.is_open() { t.last_price } else { t.exit_price };
             let charges = equity_charges(t.entry_price, exit, t.qty);
-            let gross = if t.is_open() {
-                (t.last_price - t.entry_price) * t.qty as f64
+            let net = if t.is_open() {
+                (t.last_price - t.entry_price) * t.qty as f64 - charges
             } else {
                 t.pnl
             };
             let mut v = serde_json::to_value(t).unwrap_or_else(|_| json!({}));
             if let Some(o) = v.as_object_mut() {
                 o.insert("charges".into(), json!(round2(charges)));
-                o.insert("netPnl".into(), json!(round2(gross - charges)));
+                o.insert("netPnl".into(), json!(round2(net)));
             }
             v
         })
@@ -1016,8 +1064,18 @@ async fn close_trade(
     t.exited_at = now_secs();
     t.exit_date = ymd(today_ist());
     t.exit_reason = reason.to_string();
-    t.pnl = round2((fill - t.entry_price) * t.qty as f64);
-    t.pnl_pct = round2(if t.entry_price > 0.0 { (fill / t.entry_price - 1.0) * 100.0 } else { 0.0 });
+    // Book the NET result (gross move minus the real round-trip delivery
+    // charges). Recording the gross number was why the paper book looked like a
+    // profit while it was actually losing money to charges.
+    let gross = (fill - t.entry_price) * t.qty as f64;
+    let charges = equity_charges(t.entry_price, fill, t.qty);
+    t.pnl = round2(gross - charges);
+    t.net_now = t.pnl;
+    t.pnl_pct = round2(if t.entry_price > 0.0 {
+        (t.pnl / (t.entry_price * t.qty as f64)) * 100.0
+    } else {
+        0.0
+    });
     t.days = (today_ist() - (t.opened_at + 19_800) / 86_400).max(0);
     if !order_id.is_empty() {
         t.order_id = format!("{} / exit {order_id}", t.order_id);
@@ -1127,6 +1185,14 @@ async fn enter_one(
             .min(remaining)
             .max(0.0)
     };
+    // Never let one name exceed the per-name cap: this is the difference between
+    // a single bad stop costing a slice of a slot and it costing half the book.
+    let name_cap = if settings.max_position_pct > 0.0 {
+        (capital * settings.max_position_pct / 100.0).max(0.0)
+    } else {
+        alloc
+    };
+    let alloc = alloc.min(name_cap).max(0.0);
     let px = price_for(st, &symbol, &exch, row_px).await;
     if px <= 0.0 {
         return Err("no usable entry price".into());
@@ -1345,7 +1411,12 @@ async fn run_cycle_inner(st: &DhanState, mode: &str) {
                 if settings.trail_sl_on && t.entry_price > 0.0 {
                     let peak = (t.peak_price - t.entry_price).max(0.0);
                     let stop = equity_trail_stop(t.entry_price, peak, settings.trail_sl_pct);
-                    if stop > t.trail_stop {
+                    // Only arm once the trailing level has climbed ABOVE the
+                    // charge break-even. A trail that arms below it exits at a
+                    // net loss on a tiny wiggle (the 521 same-day churn trades);
+                    // until it clears costs the fixed stop is the only risk exit.
+                    let be = equity_breakeven_price(t.entry_price, t.qty);
+                    if stop >= be && stop > t.trail_stop {
                         t.trail_stop = round2(stop);
                     }
                 }

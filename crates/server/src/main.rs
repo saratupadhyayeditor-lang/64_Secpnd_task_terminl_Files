@@ -254,6 +254,7 @@ async fn main() {
     let paper_rt = RealtimeState::new_paper(dhan.clone()).with_template_pool(template_pool.clone());
     let paper2_rt = RealtimeState::new_paper2(dhan.clone()).with_template_pool(template_pool.clone());
     let paper3_rt = RealtimeState::new_paper3(dhan.clone()).with_template_pool(template_pool.clone());
+    let paper4_rt = RealtimeState::new_paper4(dhan.clone()).with_template_pool(template_pool.clone());
     let autoexp_rt = RealtimeState::new_autoexp(dhan.clone()).with_template_pool(template_pool.clone());
     let aitrader_rt = RealtimeState::new_aitrader(dhan.clone()).with_template_pool(template_pool.clone());
     let aitraderlive_rt = RealtimeState::new_aitraderlive(dhan.clone()).with_template_pool(template_pool.clone());
@@ -277,6 +278,7 @@ async fn main() {
             paper_rt.clone(),
             paper2_rt.clone(),
             paper3_rt.clone(),
+            paper4_rt.clone(),
             autoexp_rt.clone(),
             aitrader_rt.clone(),
             aitraderlive_rt.clone(),
@@ -385,6 +387,7 @@ async fn main() {
         .merge(realtime::paper_router().with_state(paper_rt))
         .merge(realtime::paper2_router().with_state(paper2_rt))
         .merge(realtime::paper3_router().with_state(paper3_rt))
+        .merge(realtime::paper4_router().with_state(paper4_rt))
         .merge(realtime::autoexp_router().with_state(autoexp_rt))
         .merge(realtime::aitrader_router().with_state(aitrader_rt))
         .merge(realtime::aitraderlive_router().with_state(aitraderlive_rt))

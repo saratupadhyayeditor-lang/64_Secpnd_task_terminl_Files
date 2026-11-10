@@ -904,15 +904,27 @@ fn feasibility(
     }
 }
 
-fn sigmoid(x: f64) -> f64 {
-    1.0 / (1.0 + (-x).exp())
-}
-
+/// Empirical probability from measured walk-forward results.
+///
+/// The reported confidence is the actual hit-rate of the same target/stop rule
+/// on historical bars, shrunk toward 50% with a Beta(1,1) prior so a handful of
+/// trades cannot produce a fake 95% (or 5%) number. The structural setup score
+/// (`raw`) is used ONLY as a weak prior while there is little evidence; once 30+
+/// samples exist the measured hit-rate dominates (>75% weight) and the reported
+/// value converges to what the strategy actually delivered. It is deliberately
+/// never allowed to exceed the measured hit-rate by more than a small margin
+/// once the sample is meaningful, so the UI cannot show an inflated probability.
 fn calibrate(raw: f64, trades: i64, hit: f64, regime: &str, blackout: bool) -> Value {
-    let p_model = sigmoid((raw - 50.0) / 13.0);
-    let hist = if trades >= 20 { hit / 100.0 } else { 0.5 };
-    let w = (trades as f64 / (trades as f64 + 40.0)).min(0.5);
-    let mut p = p_model * (1.0 - w * 0.5) + hist * (w * 0.5);
+    let n = trades.max(0) as f64;
+    // Beta(1,1)-smoothed empirical win probability: (wins+1)/(n+2).
+    let wins = (hit / 100.0 * n).clamp(0.0, n);
+    let p_emp = if n > 0.0 { (wins + 1.0) / (n + 2.0) } else { 0.5 };
+    // Weak structural prior: only spans 0.5..0.75 so it can never by itself
+    // manufacture a high-confidence plan.
+    let p_prior = (0.5 + (raw - 50.0) / 200.0).clamp(0.2, 0.75);
+    // Evidence weight: 0 trades -> prior, 30 -> half, 120 -> 0.8, 300 -> 0.91.
+    let w = (n / (n + 30.0)).min(0.95);
+    let mut p = p_prior * (1.0 - w) + p_emp * w;
     if regime == "RANGE" {
         p *= 0.92;
     } else if regime == "VOLATILE" {
@@ -921,14 +933,23 @@ fn calibrate(raw: f64, trades: i64, hit: f64, regime: &str, blackout: bool) -> V
     if blackout {
         p *= 0.55;
     }
-    let p = clamp(p, 0.05, 0.95);
+    let p = clamp(p, 0.02, 0.95);
+    // Transparency: when the sample is meaningful, cap the displayed value so
+    // it can never sit more than 5 points above the measured hit-rate.
+    let capped = if n >= 20.0 {
+        (p * 100.0).min(hit + 5.0).max(hit - 15.0)
+    } else {
+        p * 100.0
+    };
     json!({
         "raw": round(raw, 1),
-        "probability": round(p * 100.0, 1),
-        "model": round(p_model * 100.0, 1),
-        "history": round(hist * 100.0, 1),
+        "probability": round(capped, 1),
+        "empirical": round(p_emp * 100.0, 1),
+        "prior": round(p_prior * 100.0, 1),
+        "history": round(hit, 1),
+        "samples": trades,
         "weight": round(w, 2),
-        "basis": if trades >= 20 { "backtest+model" } else { "model prior" },
+        "basis": if n >= 20.0 { "backtest (measured)" } else { "thin evidence (prior+backtest)" },
     })
 }
 

@@ -437,7 +437,11 @@ fn bar_owner_key(sec_id: i64, exch: &str) -> String {
 
 impl MarketState {
     pub fn new() -> Self {
-        let (bc, _) = broadcast::channel(16);
+        // Deep enough that a slow client / tick burst does not silently drop
+        // quote frames (the old depth of 16 was the source of the "jumpy" repaint
+        // where a batch arrived only after a stall). Even if a client still lags
+        // past this ring, `ws_loop` resyncs it with a full snapshot.
+        let (bc, _) = broadcast::channel(1024);
         MarketState {
             quotes: Arc::new(Mutex::new(HashMap::new())),
             bc,
@@ -957,7 +961,22 @@ async fn ws_loop(mut socket: WebSocket, st: DhanState) {
                             break;
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        // The client fell behind the ring. Rather than silently
+                        // skip (which showed a frozen-then-jump price), resend the
+                        // full quote snapshot so it resyncs to the current state.
+                        let snap = {
+                            let data = mk
+                                .quotes
+                                .lock()
+                                .map(|g| Value::Object(g.iter().map(|(k, v)| (k.clone(), v.clone())).collect()))
+                                .unwrap_or_else(|_| json!({}));
+                            json!({ "type": "quotes", "data": data }).to_string()
+                        };
+                        if socket.send(Message::Text(snap)).await.is_err() {
+                            break;
+                        }
+                    }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }

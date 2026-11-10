@@ -23,18 +23,19 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 /// Paper-family engine tabs, sharing one pool.
-pub const PAPER_ENGINES: [&str; 6] = ["paper", "paper2", "paper3", "autoexp", "aitrader", "equitypaper"];
+pub const PAPER_ENGINES: [&str; 7] = ["paper", "paper2", "paper3", "paper4", "autoexp", "aitrader", "equitypaper"];
 /// Real/Dhan-family engine tabs, sharing one pool.
 pub const REALTIME_ENGINES: [&str; 5] = ["realtime", "realtime2", "realtime3", "aitraderlive", "equitylive"];
 
 /// Every engine tab that participates in a shared pool.
-pub const ENGINE_IDS: [&str; 11] = [
+pub const ENGINE_IDS: [&str; 12] = [
     "realtime",
     "realtime2",
     "realtime3",
     "paper",
     "paper2",
     "paper3",
+    "paper4",
     "autoexp",
     "aitrader",
     "aitraderlive",
@@ -339,13 +340,14 @@ fn seed_paper_defaults(s: &mut SharedMargin) {
 /// Engine id -> the durable state file that used to hold its manual margin.
 /// Only read ONCE (guarded by `legacy_migrated`) so a later edit is never
 /// overwritten.
-const LEGACY_FILES: [(&str, &str); 11] = [
+const LEGACY_FILES: [(&str, &str); 12] = [
     ("realtime", "algodhan_realtime_state.json"),
     ("realtime2", "algodhan_realtime2_state.json"),
     ("realtime3", "algodhan_realtime3_state.json"),
     ("paper", "algodhan_paper_state.json"),
     ("paper2", "algodhan_paper2_state.json"),
     ("paper3", "algodhan_paper3_state.json"),
+    ("paper4", "algodhan_paper4_state.json"),
     ("autoexp", "algodhan_autoexp_state.json"),
     ("aitrader", "algodhan_aitrader_state.json"),
     ("aitraderlive", "algodhan_aitraderlive_state.json"),
@@ -751,6 +753,7 @@ mod tests {
         assert_eq!(group_of("paper"), "paper");
         assert_eq!(group_of("paper2"), "paper");
         assert_eq!(group_of("paper3"), "paper");
+        assert_eq!(group_of("paper4"), "paper");
         assert_eq!(group_of("autoexp"), "paper");
         assert_eq!(group_of("aitrader"), "paper");
         assert_eq!(group_of("equitypaper"), "paper");
